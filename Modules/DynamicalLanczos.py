@@ -96,7 +96,7 @@ def is_julia_enabled():
 
 
 class Lanczos(object):
-    def __init__(self, ensemble = None, mode = 1, unwrap_symmetries = False, select_modes = None):
+    def __init__(self, ensemble = None, mode = 1, unwrap_symmetries = False, select_modes = None, lo_to_split = "random"):
         """
         INITIALIZE THE LANCZOS
         ======================
@@ -121,6 +121,9 @@ class Lanczos(object):
             select_modes : ndarray(size = n_modes, dtype = bool)
                 A mask for each mode, if False, the mode is neglected. Use this to exclude some modes that you know are not
                 involved in the calculation. If not specified, all modes are considered by default.
+            lo_to_split : string or ndarray
+                Mode of lo_to_splitting. If empty or none, it is LO-TO splitting correction is neglected.
+                If a ndarray is provided, it is the direction of q on which the LO-TO splitting is computed.
 
         """
 
@@ -203,7 +206,7 @@ class Lanczos(object):
 
         self.T = ensemble.current_T
 
-        ws, pols = self.dyn.DiagonalizeSupercell()
+        ws, pols = self.dyn.DiagonalizeSupercell(lo_to_split = lo_to_split)
 
 
         self.nat = self.super_structure.N_atoms
