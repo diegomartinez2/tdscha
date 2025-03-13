@@ -32,6 +32,54 @@ import sscha_HP_odd
 import cellconstructor.Settings as Parallel
 from tdscha.Parallel import pprint as print
 from tdscha.Parallel import *
+import tdscha.Perturbations as perturbations
+
+
+# Try to import the julia module
+__JULIA_EXT__ = False
+try:
+    import julia, julia.Main
+
+    # Compile the tdscha code
+    julia.Main.include(os.path.join(os.path.dirname(__file__), "tdscha_core.jl"))
+    __JULIA_EXT__ = True
+except:
+    pass
+
+# Try to import the julia module
+__JULIA_EXT__ = False
+try:
+    import julia, julia.Main
+    julia.Main.include(os.path.join(os.path.dirname(__file__), 
+        "tdscha_core.jl"))
+    __JULIA_EXT__ = True
+except:
+    try:
+        import julia
+        from julia.api import Julia
+        jl = Julia(compiled_modules=False)
+        import julia.Main
+        try:
+            julia.Main.include(os.path.join(os.path.dirname(__file__),
+                "tdscha_core.jl"))
+            __JULIA_EXT__ = True
+        except:
+            # Install the required modules
+            julia.Main.eval("""
+using Pkg
+Pkg.add("SparseArrays")
+Pkg.add("InteractiveUtils")
+""")
+            try:
+                julia.Main.include(os.path.join(os.path.dirname(__file__),
+                    "tdscha_core.jl"))
+                __JULIA_EXT__ = True
+            except Exception as e:
+                warnings.warn("Julia extension not available.\nError: {}".format(e))
+    except Exception as e:
+        warnings.warn("Julia extension not available.\nError: {}".format(e))
+    pass
+
 
 # Try to import the julia module
 __JULIA_EXT__ = False
@@ -81,8 +129,8 @@ try:
     __RyToK__ =  Rydberg / units["kB"]
     
 except:
-    Rydberg = 13.605698066
-    Bohr = 1.889725989
+    Rydberg = 13.605698066 #RY->eV
+    Bohr = 1.889725989 #Angstrom -> Bohr
     __RyToK__ = 157887.32400374097
 
 
@@ -94,9 +142,14 @@ except:
     
 
 def f_ups(w, T):
-    """
+    r"""
     The eigenvalue of the upsilon matrix as a function of the frequency and the
-    temperature
+    temperature. This is (xi^2_\mu)^-1.
+    
+    Parameters:
+    ----------
+        -w, frequencies in Rydberg
+        -T, temperature in Kelvin
     """
 
     n_w = bose_occupation(w, T)
@@ -115,13 +168,19 @@ MODE_FAST_MPI = 2
 MODE_FAST_SERIAL = 1
 MODE_SLOW_SERIAL = 0
 
+def is_julia_enabled():
+    return __JULIA_EXT__
+
+def is_julia_enabled():
+    return __JULIA_EXT__
+
 
 def is_julia_enabled():
     return __JULIA_EXT__
 
 
 class Lanczos(object):
-    def __init__(self, ensemble = None, mode = None, unwrap_symmetries = False, select_modes = None, lo_to_split = "random"):
+    def __init__(self, ensemble = None, mode = None, unwrap_symmetries = False, select_modes = None, use_wigner = False, lo_to_split = "random"):
         """
         INITIALIZE THE LANCZOS
         ======================
@@ -145,11 +204,12 @@ class Lanczos(object):
                 This requires SPGLIB installed.
             select_modes : ndarray(size = n_modes, dtype = bool)
                 A mask for each mode, if False, the mode is neglected. Use this to exclude some modes that you know are not
+                involved in the calculation. If not specified, all modes are considered by default.  
+            use_wigner: bool, if True Wigner equations are used.
                 involved in the calculation. If not specified, all modes are considered by default.
             lo_to_split : string or ndarray
                 Mode of lo_to_splitting. If empty or none, it is LO-TO splitting correction is neglected.
                 If a ndarray is provided, it is the direction of q on which the LO-TO splitting is computed.
-
         """
 
         if is_julia_enabled():
@@ -166,27 +226,39 @@ class Lanczos(object):
         #    order = "F"
 
         # HERE DEFINE ALL THE VARIABLES FOR THE Dynamical Lanczos
+        # The temperature
         self.verbose = True
-
         self.T = 0
+        # Number of atoms in the supercell
         self.nat = 0
+        # The array of masses in the supercell, np.shape = 3 * N_at_sc
         self.m = []
+        # Auxiliary eigenmodes of SCHA
         self.w = []
+        # Auxiliary eigenvectors of SCHA
         self.pols = []
+        # The numbero of modes, translations excluded
         self.n_modes = 0
         self.ignore_harmonic = False 
+        # Ignore D3 and D4
         self.ignore_v3 = False
         self.ignore_v4 = False
+        # Number of configurations
         self.N = 0
+        # The weights from the static calculations
         self.rho = []
+        # Effective number of configurations
         self.N_eff = 0
+        # The satic displacements in the polarization basis
         self.X = []
+        # The static forces in the polarization basis
         self.Y = []
+        # The vector on which we apply Lanczos
         self.psi = []
         self.eigvals = None
         self.eigvects = None
         # In the custom lanczos mode
-        self.a_coeffs = [] #Coefficients on the diagonal
+        self.a_coeffs = [] # Coefficients on the diagonal
         self.b_coeffs = [] # Coefficients close to the diagonal
         self.c_coeffs = [] # Coefficients in the case of the biconjugate Lanczos
         self.krilov_basis = [] # The basis of the krilov subspace
@@ -203,9 +275,13 @@ class Lanczos(object):
         self.initialized = False
         self.perturbation_modulus = 1
         self.dyn = None
+        # Unit cell structure
         self.uci_structure = None
+        # Structure for the supercell
         self.super_structure = None
+        # Symmetries
         self.qe_sym = None
+        # The application of L as a linear operator
         self.L_linop = None
         self.M_linop = None
         self.unwrapped = False
@@ -214,10 +290,17 @@ class Lanczos(object):
         self.n_syms = 1
 
         self.u_tilde = None
+        # The static forces divided by the sqrt(masses)
         self.f_tilde = None
 
         self.sym_block_id = None
-
+        
+        # Set to True if we want to use the Wigner equations
+        self.use_wigner = use_wigner
+        
+        # This flag is usefull to work with 1D or 2D systems
+        # Default is False meaning that we ignore only translational modes
+        self.ignore_small_w = False
 
         # Setup the attribute control
         self.__total_attributes__ = [item for item in self.__dict__.keys()]
@@ -229,16 +312,13 @@ class Lanczos(object):
 
 
         # ========== END OF VARIABLE DEFINITION (EACH NEW DEFINITION FROM NOW ON RESULTS IN AN ERROR) =======
-
         self.dyn = ensemble.current_dyn.Copy() 
-        #superdyn = self.dyn.GenerateSupercellDyn(ensemble.supercell)
         self.uci_structure = ensemble.current_dyn.structure.copy()
         self.super_structure = self.dyn.structure.generate_supercell(self.dyn.GetSupercell())#superdyn.structure
 
         self.T = ensemble.current_T
 
         ws, pols = self.dyn.DiagonalizeSupercell(lo_to_split = lo_to_split)
-
 
         self.nat = self.super_structure.N_atoms
         n_cell = np.prod(self.dyn.GetSupercell())
@@ -251,29 +331,36 @@ class Lanczos(object):
         self.m = np.tile(m, (3,1)).T.ravel()
 
         # Remove the translations
-        trans_mask = CC.Methods.get_translations(pols, m)
-
+        if not ensemble.ignore_small_w:
+            trans_mask = CC.Methods.get_translations(pols, m)
+            good_mask  = ~trans_mask
+        else:
+            self.ignore_small_w = True
+            trans_mask = np.abs(ws) < CC.Phonons.__EPSILON_W__
+            good_mask  = ~trans_mask
+        
         # If requested, isolate only the specified modes.
-        good_mask = ~trans_mask
         if select_modes is not None:
             if len(select_modes) != len(trans_mask):
                 raise ValueError("""
 Error, 'select_modes' should be an array of the same lenght of the number of modes.
  n_modes = {} | len(select_modes) = {}
 """.format(len(ws), len(select_modes)))
-
+            print()
+            print('Selecting some of the modes...')
+            print()
             good_mask = (~trans_mask) & select_modes
 
-        # Get the polarization vectors
+        # Get the frequencies in Ry and polarization vectors
         self.w = ws[good_mask]
         self.pols = pols[:, good_mask]
 
         # Correctly reshape the polarization in case only one mode is selected
         if len(self.w) == 1:
             self.pols = self.pols.reshape((len(self.m), 1))
-
+        
+        # Get the number of modes
         self.n_modes = len(self.w)
-
 
         # Prepare the list of q point starting from the polarization vectors
         #q_list = CC.symmetries.GetQForEachMode(self.pols, self.uci_structure, self.super_structure, self.dyn.GetSupercell())
@@ -283,20 +370,21 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         #for iq, q in enumerate(q_list):
         #    self.q_vectors[iq, :] = CC.Methods.covariant_coordinate(bg, q)
         
-
-
         # Ignore v3 or v4. You can set them for testing
         # This is no longer implemented in the fast Lanczos
         self.ignore_v3 = False
         self.ignore_v4 = False
 
+        # The number of configurations
         self.N = ensemble.N
         rho = ensemble.rho.copy() 
+        # Transform Angstrom -> Bohr
         u = ensemble.u_disps  / Ensemble.Bohr
+        # Forces are in Ry/Angstrom for now only
         f = ensemble.forces.reshape(self.N, 3 * self.nat).copy()
         f -= ensemble.sscha_forces.reshape(self.N, 3 * self.nat)
 
-        # Get the average force
+        # Get the average force in the unit cell, (N_at_uc, 3)
         f_mean = ensemble.get_average_forces(get_error = False)
 
         # Perform the symmetrization of the average force
@@ -307,7 +395,7 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         # Reproduce the average force on the full supercell
         f_mean = np.tile(f_mean, (np.prod(ensemble.current_dyn.GetSupercell()), 1)).ravel()
 
-        # Transpform in Bohr
+        # Transform forces in Ry/Bohr
         f_mean *= Ensemble.Bohr
         
         # Subtract also the average force to clean more the stochastic noise
@@ -315,6 +403,8 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         #new_av_force = np.tile(av_force, (n_cell, 1)).ravel()
         
         #f -= np.tile(new_av_force, (self.N, 1)) 
+        
+        # Transform in Ry/Bohr
         f *= Ensemble.Bohr
 
         if unwrap_symmetries:
@@ -330,7 +420,6 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         #print(np.shape(f), np.shape(f_mean))
         f[:, :] -= np.tile(f_mean, (self.N, 1))
 
-
         # Perform the mass rescale to get the tilde variables
         u *= np.tile(np.sqrt(self.m), (self.N, 1)) 
         f /= np.tile(np.sqrt(self.m), (self.N, 1)) 
@@ -339,18 +428,21 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         self.rho = rho
         self.N_eff = np.sum(self.rho)
 
+        # Mass rescaled quantities
         self.u_tilde = u
         self.f_tilde = f
 
+        # The dispalcements in BOHR mass resclaed and in polarization basis
         self.X = np.zeros((self.N, self.n_modes), order = order, dtype = TYPE_DP)
+        # The forces in RY/BOHR mass resclaed and in polarization basis
         self.Y = np.zeros((self.N, self.n_modes), order = order, dtype = TYPE_DP)
 
-        # Convert in the polarization space
+        # Convert in the polarization space the displacements and the forces
         self.X[:, :] = self.u_tilde.dot(self.pols) #.T.dot(self.u_tilde)
         self.Y[:, :] = self.f_tilde.dot(self.pols) #self.pols.T.dot(self.f_tilde)
 
-
         # Prepare the variable used for the working
+        # The len of psi = N_modes + 0.5 * N_modes * (N_modes + 1) + 0.5 * N_modes * (N_modes + 1)
         len_psi = self.n_modes
         #if self.T < __EPSILON__:
         #    len_psi += self.n_modes**2
@@ -358,22 +450,37 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         len_psi += self.n_modes * (self.n_modes + 1)
         #print("N MODES:", self.n_modes)
         #print("LEN PSI:", len_psi)
-
+        
+        # In Wigner the variables are a'^(1) and b'^(1) 
+        # In Standard the variables are Y^(1) and ReA^(1)
+        
+        ##########################################################
+        # Psi contains R^(1), Upsilon^(1)-a'^(1), ReA^(1)-b'^(1) #
+        ##########################################################
+        
+        # Everything is in the polarization basis
         self.psi = np.zeros(len_psi, dtype = TYPE_DP)
+        
+        ################################################################
+        # For the matrices the code will store only the upper triangle #
+        ################################################################
 
-        # Prepare the L as a linear operator (Prepare the possibility to transpose the matrix)
+        # Prepare the L as a linear operator 
+        # Prepare the possibility to transpose the matrix with L_transp
         def L_transp(psi):
-            return self.apply_full_L(psi, transpose= True)
-        self.L_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)), matvec = self.apply_full_L, rmatvec = L_transp, dtype = TYPE_DP)
+            return self.apply_full_L(psi, transpose = True)
+        self.L_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)),\
+                                                          matvec = self.apply_full_L, rmatvec = L_transp, dtype = TYPE_DP)
 
         # Define the preconditioner
         def M_transp(psi):
             return self.apply_L1_inverse_FT(psi, transpose = True)
-        self.M_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)), matvec = self.apply_L1_inverse_FT, rmatvec = M_transp, dtype = TYPE_DP)
+        self.M_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)),\
+                                                          matvec = self.apply_L1_inverse_FT, rmatvec = M_transp, dtype = TYPE_DP)
 
 
         # Prepare the solution of the Lanczos algorithm
-        self.eigvals = None
+        self.eigvals  = None
         self.eigvects = None 
 
         # Store the basis and the coefficients of the Lanczos procedure
@@ -434,7 +541,7 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
 
         # Store the basis and the coefficients of the Lanczos procedure
         # In the custom lanczos mode
-        self.a_coeffs = [] #Coefficients on the diagonal
+        self.a_coeffs = [] # Coefficients on the diagonal
         self.b_coeffs = [] # Coefficients close to the diagonal
         self.c_coeffs = []
 
@@ -460,7 +567,7 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
     
         """
         # Prepare the variable used for the working
-        len_psi = self.n_modes
+        len_psi  = self.n_modes
         len_psi += self.n_modes * (self.n_modes + 1)
         self.psi = np.zeros(len_psi, dtype = TYPE_DP)
         
@@ -643,7 +750,6 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         self.sym_block_id = -np.ones(self.n_modes, dtype = np.intc)
         self.n_syms =  self.symmetries[0].shape[0]
 
-
         if self.mode is MODE_FAST_JULIA:
             # Get the max length
             max_val = 0
@@ -674,9 +780,6 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
 
         if verbose:
             print("Time to create the block_id array: {} s".format(t2-t1))
-
-
-
 
         # Ns, dumb, dump = np.shape(pol_symmetries)
         
@@ -709,7 +812,7 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
         #self.N_degeneracy = N_deg
         #self.degenerate_space = deg_space
 
-    def prepare_input_files(self, root_name = "tdscha", n_steps = 100, start_from_scratch = True, directory="."):
+    def prepare_input_files(self, root_name = "tdscha", n_steps = 100, start_from_scratch = True, directory=".", run_symm = False):
         """
         PREPARE INPUT FILES
         ===================
@@ -728,6 +831,8 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
                 If True the calculation is restarted from scratch.
             directory : string
                 Path to the directory on which the input files will be saved
+            run_symm : bool
+                True if we use the Wigner representation
 
         
         This file will prepare inside the directory the following input files.
@@ -759,6 +864,8 @@ Error, 'select_modes' should be an array of the same lenght of the number of mod
                      "ignore_v2" : self.ignore_harmonic,
                      "ignore_v3" : self.ignore_v3,
                      "ignore_v4" : self.ignore_v4,
+                     "use_wigner" : self.use_wigner,
+                     "run_sym": run_symm,
                      "data" : {
                          "n_configs" : int(self.N),
                          "n_modes" : int(self.n_modes),
@@ -893,7 +1000,7 @@ File {} not found. S norm not loaded.
 
 
 
-    def prepare_raman(self, pol_vec_in = np.array([1,0,0]), pol_vec_out = np.array([1,0,0]), unpolarized: int = None):
+    def prepare_raman(self, pol_vec_in = np.array([1,0,0]), pol_vec_out = np.array([1,0,0]), mixed = False, pol_in_2 = None, pol_out_2 = None, unpolarized: int = None):
         """
         PREPARE LANCZOS FOR RAMAN SPECTRUM
         ==================================
@@ -927,6 +1034,15 @@ File {} not found. S norm not loaded.
         # Check if the raman tensor is present
         assert not self.dyn.raman_tensor is None, "Error, no Raman tensor found. Cannot initialize the Raman responce"
 
+        # Get the raman vector (apply the ASR and contract the raman tensor with the polarization vectors)
+        raman_v = self.dyn.GetRamanVector(pol_vec_in, pol_vec_out)
+        
+        if mixed:
+            print('Prepare Raman')
+            print('Adding other component of the Raman tensor')
+            raman_v += self.dyn.GetRamanVector(pol_in_2, pol_out_2)
+
+        # Get the raman vector in the supercelld
         n_supercell = np.prod(self.dyn.GetSupercell())
 
         if unpolarized is None:
@@ -1004,7 +1120,530 @@ File {} not found. S norm not loaded.
 
 
 
+        # Convert in the polarization basis and store the intensity
+        self.prepare_perturbation(new_raman_v, masses_exp=-1)
+        
+    def get_prefactors_unpolarized_raman(self, index):
+        """
+        RETURNS THE PREFACTORS FOR COMPUTING THE UNPOLARIZED RAMAN
+        ==========================================================
+        
+        It returns a dictionary with the prefactors
+        
+        The prefactors corresponds to the components of the unpolarized raman signal
+        """
+        labels = [i for i in range(7)]
+        if not(index in labels):
+            raise ValueError('{} should be in {}'.format(index, labels))
+            
+        dictionary = {'(xx+yy+zz)^2' : 45/9,\
+                      '(xx-yy)^2'    : 7/2,\
+                      '(xx-zz)^2'    : 7/2,\
+                      '(yy-zz)^2'    : 7/2,\
+                      '(xy)^2'       : 7*3,\
+                      '(xz)^2'       : 7*3,\
+                      '(yz)^2'       : 7*3}
+        
+        keys = list(dictionary.keys())
+        
+        
+        return dictionary[keys[index]]
+    
+    def prepare_unpolarized_raman(self, index = 0, debug = False):
+        """
+        PREPARE UNPOLARIZED RAMAN SIGNAL
+        ================================
+        
+        The raman tensor is read from the dynamical matrix provided by the original ensemble.
+        
+        The perturbations are prepared accordin to the formula (see https://doi.org/10.1021/jp5125266)
+        
+        ..math:
+        
+            I_unpol = 45/9 (xx + yy + zz)^2
+                      + 7/2 [(xx-yy)^2 + (xx-zz)^2 + (yy-zz)^2]
+                      + 7 * 3 [(xy)^2 + (yz)^2 + (xz)^2]
+        """
+        # Check if the raman tensor is present
+        assert not self.dyn.raman_tensor is None, "Error, no Raman tensor found. Cannot initialize the Raman responce"
+        
+        labels = [i for i in range(7)]
+        if not(index in labels):
+            raise ValueError('{} should be in {}'.format(index, labels))
+        
+        epols = {'x' : np.array([1,0,0]),\
+                 'y' : np.array([0,1,0]),\
+                 'z' : np.array([0,0,1])}
+        
+        # (xx + yy + zz)^2
+        if index == 0:
+            raman_v  = self.dyn.GetRamanVector(epols['x'], epols['x'])
+            raman_v += self.dyn.GetRamanVector(epols['y'], epols['y'])
+            raman_v += self.dyn.GetRamanVector(epols['z'], epols['z'])
+        # (xx - yy)^2    
+        elif index == 1:
+            raman_v  = self.dyn.GetRamanVector(epols['x'], epols['x'])
+            raman_v -= self.dyn.GetRamanVector(epols['y'], epols['y'])
+        # (xx - zz)^2       
+        elif index == 2:
+            raman_v  = self.dyn.GetRamanVector(epols['x'], epols['x'])
+            raman_v -= self.dyn.GetRamanVector(epols['z'], epols['z'])
+        # (yy - zz)^2   
+        elif index == 3:
+            raman_v  = self.dyn.GetRamanVector(epols['y'], epols['y'])
+            raman_v -= self.dyn.GetRamanVector(epols['z'], epols['z'])
+        # (xy)^2
+        elif index == 4:
+            raman_v = self.dyn.GetRamanVector(epols['x'], epols['y'])
+        # (xz)^2
+        elif index == 5:
+            raman_v = self.dyn.GetRamanVector(epols['x'], epols['z'])
+        # (yz)^2
+        elif index == 6:
+            raman_v = self.dyn.GetRamanVector(epols['y'], epols['z'])
+            
+        if debug:
+            np.save('raman_v_{}'.format(index), raman_v)
+            
+        # Get the raman vector in the supercelld
+        n_supercell = np.prod(self.dyn.GetSupercell())
+        new_raman_v = np.tile(raman_v.ravel(), n_supercell)
 
+        # Convert in the polarization basis and store the intensity
+        self.prepare_perturbation(new_raman_v, masses_exp=-1)
+        
+        if debug:
+            print('[NEW] Pertubation modulus with eq Raman tensors = {}'.format(self.perturbation_modulus))
+        print()
+                             
+        return
+    
+    
+    def prepare_unpolarized_raman_FT(self, index = 0, debug = False, eq_raman_tns = None, use_symm = True,\
+                                     ens_av_raman = None, raman_tns_ens = None, add_2ph = True):
+        """
+        PREPARE UNPOLARIZED RAMAN SIGNAL CONSIDERING FLUCTUATIONS OF THE RAMAN TENSOR
+        =============================================================================
+        
+        The raman tensor is read from the dynamical matrix provided by the original ensemble.
+        
+        The perturbations are prepared accordin to the formula (see https://doi.org/10.1021/jp5125266)
+        
+        ..math:
+        
+            I_unpol = 45/9 (xx + yy + zz)^2
+                      + 7/2 [(xx-yy)^2 + (xx-zz)^2 + (yy-zz)^2]
+                      + 7 * 3 [(xy)^2 + (yz)^2 + (xz)^2]
+                      
+        Parameters:
+        -----------
+            -index: the pol component of the unpolarized signal
+            -debug: if true we save the second order Raman tensor
+            -eq_raman_tns: np.array with shape (3, 3, 3 * N_at_uc), the equilibirum raman tensor
+            -use_symm: bool, if True symmetries are enforced
+            -ens_av_raman:  the ensemble on which we compute the averages of the Raman tensors
+            -raman_tns_ens: np.array with shape (N_conf, 3, 3, 3 * N_at_sc), the raman tensors on the displaced configruations
+        """
+        # Check if the raman tensor is present
+        assert not self.dyn.raman_tensor is None, "Error, no Raman tensor found. Cannot initialize the Raman responce"
+        
+        labels = [i for i in range(7)]
+        if not(index in labels):
+            raise ValueError('{} should be in {}'.format(index, labels))
+        
+        epols = {'x' : np.array([1,0,0]),\
+                 'y' : np.array([0,1,0]),\
+                 'z' : np.array([0,0,1])}
+        
+        # (xx + yy + zz)^2
+        if index == 0:
+            # raman_v  = self.dyn.GetRamanVector(epols['x'], epols['x'])
+            # raman_v += self.dyn.GetRamanVector(epols['y'], epols['y'])
+            # raman_v += self.dyn.GetRamanVector(epols['z'], epols['z'])
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   = epols['x'], pol_out   = epols['x'],\
+                                             mixed = True,\
+                                             pol_in_2 = epols['y'], pol_out_2 = epols['y'],\
+                                             pol_in_3 = epols['z'], pol_out_3 = epols['z'],\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'xx_plus_yy_plus_zz')
+        # (xx - yy)^2    
+        elif index == 1:
+            # raman_v  = self.dyn.GetRamanVector(epols['x'], epols['x'])
+            # raman_v -= self.dyn.GetRamanVector(epols['y'], epols['y'])
+            # NB we put just one minus sign because the component is (xx - yy)^2
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   =  epols['x'],  pol_out  =  epols['x'],\
+                                             mixed = True,\
+                                             pol_in_2 = -epols['y'], pol_out_2 =  epols['y'],\
+                                             pol_in_3 = np.zeros(3), pol_out_3 = np.zeros(3),\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'xx_minus_yy')
+        # (xx - zz)^2       
+        elif index == 2:
+            # raman_v  = self.dyn.GetRamanVector(epols['x'], epols['x'])
+            # raman_v -= self.dyn.GetRamanVector(epols['z'], epols['z'])
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   =  epols['x'],  pol_out  =  epols['x'],\
+                                             mixed = True,\
+                                             pol_in_2 = -epols['z'], pol_out_2 =  epols['z'],\
+                                             pol_in_3 = np.zeros(3), pol_out_3 = np.zeros(3),\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'xx_minus_zz')
+        # (yy - zz)^2   
+        elif index == 3:
+            # raman_v  = self.dyn.GetRamanVector(epols['y'], epols['y'])
+            # raman_v -= self.dyn.GetRamanVector(epols['z'], epols['z'])
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   =  epols['y'],  pol_out  =  epols['y'],\
+                                             mixed = True,\
+                                             pol_in_2 = -epols['z'], pol_out_2 =  epols['z'],\
+                                             pol_in_3 = np.zeros(3), pol_out_3 = np.zeros(3),\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'yy_minus_zz')
+        # (xy)^2
+        elif index == 4:
+            # raman_v = self.dyn.GetRamanVector(epols['x'], epols['y'])
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   =  epols['x'],  pol_out  =  epols['y'],\
+                                             mixed = False,\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'xy_square')
+        # (xz)^2
+        elif index == 5:
+            # raman_v = self.dyn.GetRamanVector(epols['x'], epols['z'])
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   =  epols['x'],  pol_out  =  epols['z'],\
+                                             mixed = False,\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'xz_square')
+        # (yz)^2
+        elif index == 6:
+            # raman_v = self.dyn.GetRamanVector(epols['y'], epols['z'])
+            self.prepare_anharmonic_raman_FT(raman = raman_tns_ens, raman_eq = eq_raman_tns,\
+                                             pol_in   =  epols['y'],  pol_out  =  epols['z'],\
+                                             mixed = False,\
+                                             add_two_ph = add_2ph, symmetrize = use_symm,\
+                                             ensemble = ens_av_raman,\
+                                             save_raman_tensor2 = debug, file_raman_tensor2 = 'yz_square')
+            
+        return
+       
+   
+
+    def prepare_anharmonic_raman_FT(self, raman = None, raman_eq = None,\
+                                    pol_in = np.array([1.,0.,0.]), pol_out = np.array([1.,0.,0.]),\
+                                    mixed = False, pol_in_2 = None, pol_out_2 = None,\
+                                    pol_in_3 = None, pol_out_3 = None,\
+                                    add_two_ph = False, symmetrize = False, ensemble = None,\
+                                    save_raman_tensor2 = False, file_raman_tensor2 = None):
+        """
+        PREPARE THE PSI VECTOR FOR ANHARMONIC RAMAN SPECTRUM CALCULATION (NEW VERSION)
+        ===========================================================================
+        
+        This works only with the Wigner representation if we add the two phonons effect. 
+        Prepare the psi vector for RAMAN spectrum considering position-dependent raman tensors.
+        
+        Parameters:
+        -----------
+            -raman: nd.array (N_configs, E_comp, E_comp, 3 * N_at_sc),
+                 the Raman tensor for all configurations.
+                 Indices are: Number of configuration, electric field component,
+                 electric field component, atomic coordinates in sc.
+            rama_eq: nd.array, (E_comp, E_comp, 3 * N_at_uc), the effective charges at equilibrium.
+                 Indices are: electric field component,
+                 electric field component, atomic coordinate in uc.   
+            -pol_in: nd.array, the polarization of in-out light. default is x
+            -pol_out: nd.array, the polarization of in-out light. default is x
+            -mixed: if True we can study the one and two phonon response to 
+                    pol_in \cdto \Xi \cdot pol_in + pol_in_2 \cdto \Xi \cdot pol_in_2 + pol_in_3 \cdto \Xi \cdot pol_in_3
+                    (\Xi is the Raman tensor)
+            -pol_in_2:  nd.array, the polarization of in-out light. default is None
+            -pol_out_2: nd.array, the polarization of in-out light. default is None
+            -pol_in_3:  nd.array, the polarization of in-out light. default is None
+            -pol_out_3: nd.array, the polarization of in-out light. default is None
+            -add_two_ph: bool, if True two phonon processes are included in the calculation
+            -symmetrize: bool, if True the first/second order Raman tensors are symmetrized
+            -ensemble: a scha ensemble object for computing the averages
+            -save_raman_tensor2: bool if True we save the second order Raman tensor
+        """
+        if not self.use_wigner and add_two_ph:
+            raise NotImplementedError('The two phonon processes are implemented only in Wigner')
+            
+        if raman is None:
+            raise ValueError('Must specify the raman tensors for all configurations!')
+            
+        if mixed:
+            #Check that we have the other polarization vectors
+            if (pol_in_2 is None) or (pol_out_2 is None):
+                raise ValueError('Must specify pol_in_2 pol_out_2 if mixed = True!')
+                
+            if (pol_in_3 is None) or (pol_out_3 is None):
+                raise ValueError('Must specify pol_in_3 pol_out_3 if mixed = True!')
+                
+            if len(pol_in_2) != 3 or len(pol_out_2) != 3:
+                raise ValueError('pol_in_2 pol_out_2 must be array of len 3')
+                
+            if len(pol_in_3) != 3 or len(pol_out_3) != 3:
+                raise ValueError('pol_in_3 pol_out_3 must be array of len 3')
+                
+        
+        print()
+        print('PREPARE THE RAMAN ANHARMONIC SPECTRUM CALCULATION')
+        print('=================================================')
+        print('Are we considering two ph effects? = {}'.format(add_two_ph))
+        print('Are we using Wigner? = {}'.format(self.use_wigner))
+        print('Are we symmetrizing the raman tensor? = {}'.format(symmetrize))
+        print()
+        if ensemble is not None:
+            Nconf = ensemble.N
+        else:
+            Nconf = self.N
+        
+        required = 'N_conf - E_field - E_field - 3 * N_at_sc'
+        assert raman.shape[0] == Nconf, 'The raman tensor in input have the wrong shape. The required is {}'.format(required)
+        assert raman.shape[1] == 3, 'The raman tensor in input have the wrong shape. The required is {}'.format(required)
+        assert raman.shape[2] == 3, 'The raman tensor in input have the wrong shape. The required is {}'.format(required)
+        assert raman.shape[3] == self.nat * 3, 'The raman tensor in input have the wrong shape. The required is {}'.format(required)
+        
+        # alpha is the polarizability
+        
+        # Get the average of the raman tensor, np.array with shape = (3, 3, 3 * N_at_sc)
+        d1alpha_dR_av = perturbations.get_d1alpha_dR_av(ensemble, raman, symmetrize = symmetrize)
+        
+        # Get the supercell dyn then set the raman tensor euqal to d1alpha_dR_av
+        sc_dyn = self.dyn.GenerateSupercellDyn(self.dyn.GetSupercell())
+        sc_dyn.raman_tensor = d1alpha_dR_av
+        
+        # Get the Raman vector np.array (3 * N_at_sc)
+        raman_vector_sc = sc_dyn.GetRamanVector(pol_in, pol_out)
+        
+        if mixed:
+            print('ONE PH SECTOR adding compoent pol_in_2 pol_out_2 of the Raman tensor')
+            raman_vector_sc += sc_dyn.GetRamanVector(pol_in_2, pol_out_2)
+            print('ONE PH SECTOR adding compoent pol_in_3 pol_out_3 of the Raman tensor')
+            raman_vector_sc += sc_dyn.GetRamanVector(pol_in_3, pol_out_3)
+            
+        
+        # Now rescale by the mass and go in polarizaiton basis
+        self.prepare_perturbation(raman_vector_sc, masses_exp = -1)
+        print('[NEW] Pertubation modulus with one ph effects only = {}'.format(self.perturbation_modulus))
+        print()
+        
+        # NOW PREPARE THE SECOND RAMAN TENSOR
+        if add_two_ph:
+            if raman_eq is not None:
+                print('[NEW] Getting the equilibirum RAMAN tensor...')
+                print()
+                n_supercell = np.prod(self.dyn.GetSupercell())
+                # raman_eq is np.array with shape = (E_field, E_field, N_at_uc * 3)
+                raman_eq_size = np.shape(raman_eq)
+                MSG = """
+                Error, raman tns of the wrong shape: {}
+                """.format(raman_eq_size)
+                assert len(raman_eq_size) == 3, MSG
+                if not self.ignore_small_w:
+                    assert raman_eq_size[2] * n_supercell == self.nat * 3 #self.n_modes + 3
+                assert raman_eq_size[0] == raman_eq_size[1] == 3
+
+                # Get the raman tensor in the supercell (E_field, E_filed, 3 * N_at_sc)
+                raman_eq_gamma = np.zeros((3, 3, 3 * n_supercell * self.dyn.structure.N_atoms), dtype = type(raman_eq[0,0,0]))
+                raman_eq_gamma = np.tile(raman_eq, n_supercell)
+                
+            print('[NEW] Getting the two phonon contribution in RAMAN...')
+
+            # d2M_dR np.array with shape = (3 * N_atoms, 3 * N_atoms, Efield)
+            if raman_eq is not None:
+                print('[NEW] Subtracting the equilibirum RAMAN tensor...')
+                # raman - raman_eq_gamma, np.array with shape = (N_configs, Efield, Efield, 3 * N_at_sc)
+                # THE RESULT HAS shape = (Efield, Efield, 3 * N_at_sc, 3 * N_at_sc)
+                d2alpha_dR = perturbations.get_d2alpha_dR_av(ensemble, raman - raman_eq_gamma, None, symmetrize = symmetrize)
+            else:
+                # THE RESULT HAS shape = (Efield, Efield, 3 * N_at_sc, 3 * N_at_sc)
+                d2alpha_dR = perturbations.get_d2alpha_dR_av(ensemble, raman, None, symmetrize = symmetrize)
+            
+            print('[NEW] Divide by the masses')
+            # Divide by the masses of the atoms in the supercell shape =  (Efield, Efield, 3 * N_at_sc, 3 * N_at_sc)
+            d2alpha_dR = np.einsum('c, abcd, d -> abcd', np.sqrt(self.m)**-1, d2alpha_dR, np.sqrt(self.m)**-1)
+            
+            if save_raman_tensor2:
+                print('[NEW] Saving the second-order SCHA Raman tensor')
+                np.save('{}'.format(file_raman_tensor2), d2alpha_dR)
+                return
+            
+            print('[NEW] Go in polarization basis')
+            # Now go in polarization basis, np.array with shape = (E_field, E_field, n_modes, n_modes)
+            # d2alpha_dR_muspace = np.einsum('cm, abcd, dn -> abmn', self.pols, d2alpha_dR, self.pols)
+            # -> substitute
+            tmp                = np.einsum('abcd, cm -> abmd', d2alpha_dR, self.pols)
+            d2alpha_dR_muspace = np.einsum('abmd, dn -> abmn', tmp, self.pols)
+
+            # Project along the direction of the filed, np.array with shape = (n_modes, n_modes)
+            dXi_dR_muspace = np.einsum('abmn, a, b -> mn', d2alpha_dR_muspace, pol_in, pol_out)
+            
+            if mixed:
+                print('TWO PH SECTOR adding component pol_in_2 pol_out_2 of the Raman tensor')
+                dXi_dR_muspace += np.einsum('abmn, a, b -> mn', d2alpha_dR_muspace, pol_in_2, pol_out_2)
+                print('TWO PH SECTOR adding component pol_in_3 pol_out_3 of the Raman tensor')
+                dXi_dR_muspace += np.einsum('abmn, a, b -> mn', d2alpha_dR_muspace, pol_in_3, pol_out_3)
+            
+            # Symmetrize in mu space, np.array with shape = (n_modes, n_modes)
+            dXi_dR_muspace = 0.5 * (dXi_dR_muspace + dXi_dR_muspace.T)
+
+            # Get chi_minus and chi_plus tensors, np.array with shape = (n_modes, n_modes)
+            chi_minus = self.get_chi_minus()
+            chi_plus  = self.get_chi_plus()
+
+            # Get the pertubations on a'^(1) b'^(1)
+            pert_a = -np.einsum('nm, nm -> nm', np.sqrt(-0.5 * chi_minus), dXi_dR_muspace)
+            pert_b = +np.einsum('nm, nm -> nm', np.sqrt(+0.5 * chi_plus) , dXi_dR_muspace)
+
+            # Check if everything is symmetric
+            assert np.all(np.abs(dXi_dR_muspace - dXi_dR_muspace.T) < 1e-10), "Second derivative of the polarizability is not symmetric in pol basis"
+            assert np.all(np.abs(pert_a - pert_a.T) < 1e-10), "a'(1) pertubation is not symmetric in pol basis"
+            assert np.all(np.abs(pert_b - pert_b.T) < 1e-10), "b'(1) pertubation is not symmetric in pol basis"
+
+            # Now get the perturbation for a'^(1)
+            current = self.n_modes
+            for i in range(self.n_modes):
+                self.psi[current : current + self.n_modes - i] = pert_a[i, i:]
+                current = current + self.n_modes - i
+
+            # Now get the pertrubation for b'^(1)
+            for i in range(self.n_modes):
+                self.psi[current : current + self.n_modes - i] = pert_b[i, i:]
+                current = current + self.n_modes - i
+
+            # Add the mask dot taking into account symmetric elements
+            mask_dot = self.mask_dot_wigner()
+            # OVERWRITE the pertubation modulus considering the two phonon sector
+            self.perturbation_modulus = self.psi.dot(self.psi * mask_dot)
+
+            print('[NEW] Perturbation modulus after adding two ph contributions RAMAN = {}'.format(self.perturbation_modulus))
+            print()
+    
+        return
+    
+    
+    
+    def prepare_anharmonic_raman_FT_2ph(self, d2alpha_dR = None, pol_in = np.array([1.,0.,0.]), pol_out = np.array([1.,0.,0.]),\
+                                    mixed = False, pol_in_2 = None, pol_out_2 = None):
+        """
+        PREPARE THE PSI VECTOR FOR RAMAN SPECTRUM CALCULATION (NEW VERSION) DIRECTLY FROM 2nd ORDER RAMAN TENSOR
+        ========================================================================================================
+        
+        This function is useful if we want to interpolate the 2nd Raman tensor on a bigger supercell.
+        
+        This works only with the Wigner representation if we add the two phonons effect. 
+        Prepare the psi vector for RAMAN spectrum considering position-dependent raman tensors.
+        
+        NOTE: we completely neglect the frist order Raman scattering!
+        
+        Parameters:
+        -----------
+            -d2alpha_dR: nd.array (E_comp, E_comp, 3 * N_at_sc, 3 * N_at_sc),
+                 2nd order Raman tensor.
+                 Indices are: Number of configuration, electric field component,
+                 electric field component, atomic coordinates in sc.   
+            -pol_in: nd.array, the polarization of in-out light. default is x
+            -pol_out: nd.array, the polarization of in-out light. default is x
+            -mixed: if True we can study the one and two phonon response to 
+                    pol_in \cdot \Xi \cdot pol_out + pol_in_2 \cdot \Xi \cdot pol_out_2
+                    (\Xi is the Raman tensor)
+            -pol_in_2: nd.array, the polarization of in-out light. default is x
+            -pol_out_2: nd.array, the polarization of in-out light. default is x
+        """
+        if not self.use_wigner:
+            raise NotImplementedError('The two phonon processes are implemented only in Wigner')
+            
+        if d2alpha_dR is None:
+            raise ValueError('Must specify the 2nd order Raman tensor!')
+            
+        exp_shape = (3, 3, self.nat * 3, self.nat * 3)
+        if d2alpha_dR.shape != exp_shape:
+            raise ValueError('The shape of the 2nd order Raman tensor is not correct, expected {}'.format(exp_shape))
+            
+        if mixed:
+            if (pol_in_2 is None) or (pol_out_2 is None):
+                raise ValueError('Must specify pol_in_2 pol_out_2 if mixed = True!')
+                
+            if len(pol_in_2) != 3 or len(pol_out_2) != 3:
+                raise ValueError('pol_in_2 pol_out_2 must be array of len 3')
+                
+        
+        print()
+        print('PREPARE THE RAMAN ANHARMONIC SPECTRUM CALCULATION FROM 2nd ORDER RAMAN TENSOR')
+        print('=============================================================================')
+        # print('Are we considering two ph effects? = {}'.format(add_two_ph))
+        print('Are we using Wigner? = {}'.format(self.use_wigner))
+        # print('Are we symmetrizing the raman tensor? = {}'.format(symmetrize))
+        print()
+            
+        print('TWO PH Going in polarization basis')
+        # Now go in polarization basis, np.array with shape = (E_field, E_field, n_modes, n_modes)
+        # d2alpha_dR_muspace = np.einsum('cm, abcd, dn -> abmn', self.pols, d2alpha_dR, self.pols)
+        # -> substitute
+        tmp                = np.einsum('abcd, cm -> abmd', d2alpha_dR, self.pols)
+        d2alpha_dR_muspace = np.einsum('abmd, dn -> abmn', tmp, self.pols)
+        # print(d2alpha_dR_muspace.shape)
+        
+        print('TWO PH Selecting the polarizations')
+        # Project along the direction of the filed, np.array with shape = (n_modes, n_modes)
+        dXi_dR_muspace = np.einsum('abmn, a, b -> mn', d2alpha_dR_muspace, pol_in, pol_out)
+        # print(dXi_dR_muspace.shape)
+        
+        if mixed:
+            print('TWO PH SECTOR adding component pol_in_2 pol_out_2 of the Raman tensor')
+            dXi_dR_muspace += np.einsum('abmn, a, b -> mn', d2alpha_dR_muspace, pol_in_2, pol_out_2)
+
+        # Symmetrize in mu space, np.array with shape = (n_modes, n_modes)
+        dXi_dR_muspace = 0.5 * (dXi_dR_muspace + dXi_dR_muspace.T)
+
+        # Get chi_minus and chi_plus tensors, np.array with shape = (n_modes, n_modes)
+        chi_minus = self.get_chi_minus()
+        chi_plus  = self.get_chi_plus()
+
+        # Get the pertubations on a'^(1) b'^(1)
+        pert_a = -np.einsum('nm, nm -> nm', np.sqrt(-0.5 * chi_minus), dXi_dR_muspace)
+        pert_b = +np.einsum('nm, nm -> nm', np.sqrt(+0.5 * chi_plus) , dXi_dR_muspace)
+
+        # Check if everything is symmetric
+        assert np.all(np.abs(dXi_dR_muspace - dXi_dR_muspace.T) < 1e-10), "Second derivative of the polarizability is not symmetric in pol basis"
+        assert np.all(np.abs(pert_a - pert_a.T) < 1e-10), "a'(1) pertubation is not symmetric in pol basis"
+        assert np.all(np.abs(pert_b - pert_b.T) < 1e-10), "b'(1) pertubation is not symmetric in pol basis"
+        
+        print('[NEW] Perturbation modulus = {}'.format(self.perturbation_modulus))
+        print()
+
+        # Now get the perturbation for a'^(1)
+        current = self.n_modes
+        for i in range(self.n_modes):
+            self.psi[current : current + self.n_modes - i] = pert_a[i, i:]
+            current = current + self.n_modes - i
+
+        # Now get the pertrubation for b'^(1)
+        for i in range(self.n_modes):
+            self.psi[current : current + self.n_modes - i] = pert_b[i, i:]
+            current = current + self.n_modes - i
+
+        # Add the mask dot taking into account symmetric elements
+        mask_dot = self.mask_dot_wigner()
+        # OVERWRITE the pertubation modulus considering the two phonon sector
+        self.perturbation_modulus = self.psi.dot(self.psi * mask_dot)
+
+        print('[NEW] Perturbation modulus adding two ph contributions RAMAN = {}'.format(self.perturbation_modulus))
+        print()
+    
+        return
+    
+    
+    
     def prepare_ir(self, effective_charges = None, pol_vec = np.array([1,0,0])):
         """
         PREPARE LANCZOS FOR INFRARED SPECTRUM COMPUTATION
@@ -1027,7 +1666,6 @@ File {} not found. S norm not loaded.
         if not effective_charges is None:
             ec = effective_charges
         
-
         n_supercell = np.prod(self.dyn.GetSupercell())
 
         # Check the effective charges
@@ -1038,21 +1676,295 @@ File {} not found. S norm not loaded.
         Error, effective charges of the wrong shape: {}
         """.format(ec_size)
         assert len(ec_size) == 3, MSG
-        #assert ec_size[0] * ec_size[2] * n_supercell == self.n_modes + 3
+        if not self.ignore_small_w:
+            assert ec_size[0] * ec_size[2] * n_supercell == self.n_modes + 3
         assert ec_size[1] == ec_size[2] == 3
 
+        # shape = (N_at_uc, 3)
         z_eff = np.einsum("abc, b", ec, pol_vec)
 
         # Get the gamma effective charge
         new_zeff = np.tile(z_eff.ravel(), n_supercell)
+
         self.prepare_perturbation(new_zeff, masses_exp = -1)
+    
+    
+    
+    def prepare_anharmonic_ir_FT(self, ec = None, ec_eq = None, pol_vec_light = np.array([1.,0.,0.]), add_two_ph = False, symmetrize = False, ensemble = None):
+        """
+        PREPARE THE PSI VECTOR FOR ANHARMONIC IR SPECTRUM CALCULATION (NEW VERSION)
+        ===========================================================================
+        
+        This works only with the Wigner representation if we add the two phonons effect. 
+        Prepare the psi vector for IR spectrum considering position-dependent effective charges.
+        
+        The one phonon scetor is symmetrized by default
+        
+        Parameters:
+        -----------
+            -effective_charges: nd.array (N_configs, N_atoms_sc, E_comp, cart_comp),
+                 the effective charges for all configurations.
+                 Indices are: Number of configuration, number of atoms in the super cell,
+                 electric field component, atomic coordinate.
+            -effective_charges_eq: nd.array, (N_atoms_uc, E_comp, cart_comp), the effective charges at equilibrium.
+                 Indices are: number of atoms in the unit cell,
+                 electric field component, atomic coordinate.   
+            -pol_vec_light: nd.array, the polarization of in-out light. default is x
+            -add_two_ph: bool, if True two phonon processes are included in the calculation
+            -symmetrize: bool, if True the first/second order effective charges are symmetrized
+            -ensemble: a scha ensemble object for computing the averages
+        """
+        if not self.use_wigner and add_two_ph:
+            raise NotImplementedError('The two phonon processes are implemented only in Wigner')
+            
+        if ec is None:
+            raise ValueError('Must specify the effective charges for all configurations!')
+            
+         
+        print()
+        print('PREPARE THE IR ANHARMONIC SPECTRUM CALCULATION')
+        print('==============================================')
+        print('Are we considering two ph effects? = {}'.format(add_two_ph))
+        print('Are we using Wigner? = {}'.format(self.use_wigner))
+        print('Are we symmetrizing the effective charges? = {}'.format(symmetrize))
+        print()
+        
+        required = 'N_conf N_at_sc E_field cart'
+        assert ec.shape[0] == ensemble.N, 'The effective charges in input have the wrong shape. The required is {}'.format(required)
+        assert ec.shape[1] == self.nat, 'The effective charges in input have the wrong shape. The required is {}'.format(required)
+        assert ec.shape[2] == ec.shape[3] == 3, 'The effective charges in input have the wrong shape. The required is {}'.format(required)
+            
+        # Get the average of the dipole moment, np.array with shape = (3 * N_at_sc, 3)
+        d1M_dR_av = perturbations.get_d1M_dR_av(ensemble, ec, symmetrize = symmetrize)
+        
+        # Project along the direction of light polarization, (3 * N_at_sc)
+        Z = np.einsum("ab, b -> a", d1M_dR_av, pol_vec_light)
+        
+        # Now rescale by the mass and go in polarizaiton basis
+        self.prepare_perturbation(Z.ravel(), masses_exp = -1)
+        print('Pertubation modulus with one ph effects only = {}'.format(self.perturbation_modulus))
+        print()
+        
+        # NOW PREPARE THE SECOND ORDER DIPOLE MOMENT
+        if add_two_ph:
+            if ec_eq is not None:
+                print('[NEW] Getting the equilibirum effective charges...')
+                print()
+                n_supercell = np.prod(self.dyn.GetSupercell())
+                # ec_eq is np.array with shape = (N_at_uc, E_field, cart)
+                ec_eq_size = np.shape(ec_eq)
+                MSG = """
+                Error, effective charges of the wrong shape: {}
+                """.format(ec_eq_size)
+                assert len(ec_eq_size) == 3, MSG
+                if not self.ignore_small_w:
+                    assert ec_eq_size[0] * ec_eq_size[2] * n_supercell == self.n_modes + 3
+                assert ec_eq_size[1] == ec_eq_size[2] == 3
 
+                # Get the eq effective charges in the supercell (N_at_sc, E_field, 3)
+                ec_eq_gamma = np.zeros((n_supercell * self.dyn.structure.N_atoms, 3, 3), dtype = type(ec_eq[0]))
+                ec_eq_gamma = np.tile(ec_eq, (n_supercell,1,1))
+                
+            print('[NEW] Getting the two phonon contribution...')
 
+            # d2M_dR np.array with shape = (3 * N_atoms, 3 * N_atoms, Efield)
+            if ec_eq is not None:
+                print('[NEW] Subtracting the equilibirum effective charges...')
+                # ec - ec_eq_gamma, np.array with shape = (N_configs, N_at_sc, Efield, cart)
+                d2M_dR = perturbations.get_d2M_dR_av(ensemble, ec - ec_eq_gamma, None, symmetrize = symmetrize)
+            else:
+                d2M_dR = perturbations.get_d2M_dR_av(ensemble, ec, None, symmetrize = symmetrize)
+
+            # Divide by the masses of the atoms in the supercell
+            d2M_dR = np.einsum('a, abc, b -> abc', np.sqrt(self.m)**-1, d2M_dR, np.sqrt(self.m)**-1)
+            
+            # Now go in polarization basis, np.array with shape = (n_modes, n_modes, E_filed)
+            d2M_dR_muspace = np.einsum('am, abc, bn -> mnc', self.pols, d2M_dR, self.pols)
+
+            # Project along the direction of the filed, np.array with shape = (n_modes, n_modes)
+            dZ_dR_muspace = np.einsum('mnc, c -> mn', d2M_dR_muspace, pol_vec_light)
+            
+            # Symmetrize in mu space, np.array with shape = (n_modes, n_modes)
+            dZ_dR_muspace = 0.5 * (dZ_dR_muspace + dZ_dR_muspace.T)
+
+            # Get chi_minus and chi_plus tensors, np.array with shape = (n_modes, n_modes)
+            chi_minus = self.get_chi_minus()
+            chi_plus  = self.get_chi_plus()
+
+            # Get the pertubations on a'^(1) b'^(1)
+            pert_a = -np.einsum('nm, nm -> nm', np.sqrt(-0.5 * chi_minus), dZ_dR_muspace)
+            pert_b = +np.einsum('nm, nm -> nm', np.sqrt(+0.5 * chi_plus) , dZ_dR_muspace)
+
+            # Check if everything is symmetric
+            assert np.all(np.abs(dZ_dR_muspace - dZ_dR_muspace.T) < 1e-10), "Second derivative of the dipole is not symmetric in pol basis"
+            assert np.all(np.abs(pert_a - pert_a.T) < 1e-10), "a'(1) pertubation is not symmetric in pol basis"
+            assert np.all(np.abs(pert_b - pert_b.T) < 1e-10), "b'(1) pertubation is not symmetric in pol basis"
+
+            # Now get the perturbation for a'^(1)
+            current = self.n_modes
+            for i in range(self.n_modes):
+                self.psi[current : current + self.n_modes - i] = pert_a[i, i:]
+                current = current + self.n_modes - i
+
+            # Now get the pertrubation for b'^(1)
+            for i in range(self.n_modes):
+                self.psi[current : current + self.n_modes - i] = pert_b[i, i:]
+                current = current + self.n_modes - i
+
+            # Add the mask dot taking into account symmetric elements
+            mask_dot = self.mask_dot_wigner()
+            # OVERWRITE the pertubation modulus considering the two phonon sector
+            self.perturbation_modulus = self.psi.dot(self.psi * mask_dot)
+
+            print('[NEW] Perturbation modulus after adding two ph contributions = {}'.format(self.perturbation_modulus))
+            print()
+    
+        return
+    
+    
+    
+        
+    def prepare_anharmonic_ir(self, ec = None, ec_eq = None, pol_vec_light = np.array([1.,0.,0.]), add_two_ph = False):
+        """
+        PREPARE THE PSI VECTOR FOR ANHARMONIC IR SPECTRUM CALCULATION
+        =============================================================
+        
+        This works only with the Wigner representation if we add the two phonons effect. 
+        Prepare the psi vector for IR spectrum considering position-dependent effective charges.
+        
+        Parameters:
+        -----------
+            -effective_charges: nd.array (N_configs, N_atoms_sc, E_comp, cart_comp),
+                 the effective charges for all configurations.
+                 Indices are: Number of configuration, number of atoms in the super cell,
+                 electric field component, atomic coordinate.
+            -effective_charges_eq: nd.array, the effective charges at equilibrium.
+                 Indices are: number of atoms in the unit cell,
+                 electric field component, atomic coordinate.   
+            -pol_vec_light: nd.array, the polarization of in-out light. default is x
+            -add_two_ph: bool, if True two phonon processes are included in the calculation
+            -symm_eff_charges: bool, if True the effective charges are symmetrized
+            -ensemble: a scha ensemble object to compute the effective charges
+        """
+        if not self.use_wigner and add_two_ph:
+            raise NotImplementedError('The two phonon processes are implemented only in Wigner')
+            
+        if ec is None:
+            raise ValueError('Must specify the effective charges for all configurations!')
+            
+        print()
+        print('PREPARE THE IR ANHARMONIC SPECTRUM CALCULATION')
+        print('==============================================')
+        print('Are we considering two ph effects? = {}'.format(add_two_ph))
+        print('Are we using Wigner? = {}'.format(self.use_wigner))
+        print()
+    
+        # The effective charges for each configuration (N_configs, N_at_sc, E_field_comp, 3)
+        eff = np.zeros((self.N, self.nat, 3, 3))
+
+        assert ec.shape == eff.shape, 'The effective charges in input have the wrong shape. The required is {}'.format(eff.shape)
+        
+        # Get the effective charges
+        eff = ec.copy()
+        
+        # FIRST DERIVATIVE OF THE DIPOLE
+        # Project along the direction of light polarization, (N_configs, N_at_sc, 3)
+        z_eff = np.einsum("iabc, b -> iac", eff, pol_vec_light)
+
+        # FIRST DERIVATIVE OF THE DIPOLE
+        # Average of effective charges on the ensemble (N_at_sc, 3)
+        d1_M = np.einsum('i, iab -> ab', self.rho, z_eff) /np.sum(self.rho)
+
+        # Now rescale by the mass and go in polarizaiton basis
+        self.prepare_perturbation(d1_M.ravel(), masses_exp = -1)
+        print('Pertubation modulus with one ph effects only = {}'.format(self.perturbation_modulus))
+        print()
+        
+        # NOW PREPARE THE SECOND ORDER DIPOLE MOMENT
+        if add_two_ph:
+            if ec_eq is not None:
+                print('Subtracting the equilibirum effective charges...')
+                print()
+                n_supercell = np.prod(self.dyn.GetSupercell())
+                ec_eq_size = np.shape(ec_eq)
+                MSG = """
+                Error, effective charges of the wrong shape: {}
+                """.format(ec_eq_size)
+                assert len(ec_eq_size) == 3, MSG
+                if not self.ignore_small_w:
+                    assert ec_eq_size[0] * ec_eq_size[2] * n_supercell == self.n_modes + 3
+                assert ec_eq_size[1] == ec_eq_size[2] == 3
+
+                # Eq effective charges, (N_at_uc, 3)
+                z_eff_eq = np.einsum("abc, b -> ac", ec_eq, pol_vec_light)
+                # Eq effective charges at gamma, (N_at_sc, 3)
+                z_eff_eq_gamma = np.tile(z_eff_eq.ravel(), n_supercell).reshape((self.nat, 3))
+
+                # This should reduce the noise when computing the 2ph vertex
+                z_eff -= z_eff_eq_gamma
+                
+            print('[OLD] Getting the two phonon contribution...')
+            
+            # Polarization vectors over mass, shape = (N_at_sc, n_modes)
+            pols_mass = np.einsum('a, am -> am', np.sqrt(self.m)**-1, self.pols)
+
+            # The mass rescaled projected effective charges in polarization basis, shape = (N_configs, n_modes)
+            z_pols_mass = np.einsum('am, ia -> im ', pols_mass, z_eff.ravel().reshape((self.N, self.nat * 3)))
+
+            # Eigenvalues of Upsilon mass rescaled, shape = (n_modes)
+            xi2_inv = f_ups(self.w, self.T)
+
+            # The mass rescaled displacements in polarization basis divided by xi2, shape = (N_configs, n_modes)
+            u_xi2 = np.einsum('im, m -> im', self.X, xi2_inv)
+
+            # Add the effective charges, shape = (N_configs, n_modes, n_modes)
+            u_xi2_Z = np.einsum('in , im -> inm', u_xi2, z_pols_mass)
+
+            # Get the reweighted average of the second derivative, shape = (n_modes, n_modes)
+            d2_M = np.einsum('i, inm -> nm', self.rho, u_xi2_Z) /np.sum(self.rho)
+            d2_M = 0.5 * (d2_M + d2_M.T)
+
+            # Get chi_minus and chi_plus tensors
+            chi_minus = self.get_chi_minus()
+            chi_plus  = self.get_chi_plus()
+
+            # Get the pertubations on a'^(1) b'^(1)
+            pert_a = -np.einsum('nm, nm -> nm', np.sqrt(-0.5 * chi_minus), d2_M)
+            pert_b = +np.einsum('nm, nm -> nm', np.sqrt(+0.5 * chi_plus) , d2_M)
+
+            # Check if everything is symmetric
+            assert np.all(np.abs(d2_M - d2_M.T) < 1e-10), "Second derivative of the dipole is not symmetric in pol basis"
+            assert np.all(np.abs(pert_a - pert_a.T) < 1e-10), "a'(1) pertubation is not symmetric in pol basis"
+            assert np.all(np.abs(pert_b - pert_b.T) < 1e-10), "b'(1) pertubation is not symmetric in pol basis"
+
+            # Now get the perturbation for a'^(1)
+            current = self.n_modes
+            for i in range(self.n_modes):
+                self.psi[current : current + self.n_modes - i] = pert_a[i, i:]
+                current = current + self.n_modes - i
+
+            # Now get the pertrubation for b'^(1)
+            for i in range(self.n_modes):
+                self.psi[current : current + self.n_modes - i] = pert_b[i, i:]
+                current = current + self.n_modes - i
+
+            # Add the mask dot taking into account symmetric elements
+            mask_dot = self.mask_dot_wigner()
+            # OVERWRITE the pertubation modulus considering the two phonon sector
+            self.perturbation_modulus = self.psi.dot(self.psi * mask_dot)
+
+            print('[OLD] Perturbation modulus after adding two ph contributions = {}'.format(self.perturbation_modulus))
+            print()
+            
+        return
+   
+        
+        
     def prepare_perturbation(self, vector, masses_exp = 1, add = False):
         r"""
         This function prepares the calculation for the Green function
 
-        <v| G|v>
+        <v| G |v>
 
         Where |v> is the vector passed as input. If you want to compute the
         raman, for istance, it can be the vector of the Raman intensities.
@@ -1060,12 +1972,15 @@ File {} not found. S norm not loaded.
         The vector can be obtained contracting it with the polarization vectors.
         The contraction can be on the numerator or on the denumerator, depending on the
         observable.
+        
+        NOTE: This function prepares the pertubation ONLY in the R sector
+        Both IR and Raman has masses_exp = -1
 
         .. math ::
 
-            v_\mu = \sum_a v_a e_\mu^a \cdot \sqrt{m_a}
+            v_\mu = \sum_a v_a e_\mu^a \cdot \sqrt{m_a} 
 
-            v_\mu = \sum_a v_a \frac{e_\mu^a}{  \sqrt{m_a}}
+            v_\mu = \sum_a v_a \frac{e_\mu^a}{  \sqrt{m_a}} 
 
         Parameters
         ----------
@@ -1090,11 +2005,15 @@ File {} not found. S norm not loaded.
         new_v = np.einsum("a, a, ab->b", m_on, vector, self.pols)
         self.psi[:self.n_modes] += new_v
 
+        # THIS IS OK IN THE WIGNER REPRESENTATION BECAUSE
+        # THE PERTUBATION ENTERS ONLY IN THE R SECTOR
         self.perturbation_modulus = new_v.dot(new_v)
 
         if self.symmetrize:
             self.symmetrize_psi()
 
+            
+            
     def prepare_mode(self, index):
         """
         Prepare the perturbation on a single phonon mode.
@@ -1105,12 +2024,69 @@ File {} not found. S norm not loaded.
             index : int
                 The index of the mode in the supercell. Starting from 0 (lowest frequency, excluding acoustic modes at Gamma) 
         """
-        
         self.reset()
 
         self.psi[:] = 0
         self.psi[index] = 1 
         self.perturbation_modulus = 1
+        
+        
+    
+    def prepare_two_ph(self, a, b):
+        """
+        Prepare the psi vector for a two phonon response.
+        Available only in Winger.
+
+        Parameters:
+        ----------
+            a, b: int indices of the modes (acustic are excluded).
+        """
+        if not self.use_wigner:
+            raise NotImplementedError('The two phonon response is available only in Wigner')
+            
+        if a > self.n_modes or b > self.n_modes:
+            raise ValueError('The a-b indices must be smaller than {}'.format(self.n_modes))
+            
+        print()
+        print('PREPARE THE TWO PHONON PERTUBATION')
+        print('Indices selected a = {} b = {}'.format(a,b))
+        print()
+            
+        self.reset()
+        self.psi[:] = 0
+        
+        # Get chi minus and chi plus, shape = (n_modes, n_modes)
+        chi_plus  = self.get_chi_plus()
+        chi_minus = self.get_chi_minus()
+        
+        # The matrix for the second derivatives
+        mat_modes = np.zeros((self.n_modes, self.n_modes))
+        
+        mat_modes[a,b] = 0.5
+        mat_modes[b,a] += 0.5
+        
+        # Get the pertbations on a' b'
+        pert_a = -np.einsum('nm, nm -> nm', np.sqrt(-0.5 * chi_minus), mat_modes)
+        pert_b = +np.einsum('nm, nm -> nm', np.sqrt(+0.5 * chi_plus) , mat_modes)
+        
+        # Now get the perturbation for a'^(1)
+        current = self.n_modes
+        for i in range(self.n_modes):
+            self.psi[current : current + self.n_modes - i] = pert_a[i, i:]
+            current = current + self.n_modes - i
+
+        # Now get the pertrubation for b'^(1)
+        for i in range(self.n_modes):
+            self.psi[current : current + self.n_modes - i] = pert_b[i, i:]
+            current = current + self.n_modes - i
+
+        # Add the mask dot taking into account symmetric elements
+        mask_dot = self.mask_dot_wigner()
+        
+        # Update the pertubation modulus
+        self.perturbation_modulus = self.psi.dot(self.psi * mask_dot)
+        
+        return
 
         
 
@@ -1144,7 +2120,7 @@ File {} not found. S norm not loaded.
         """
         Set the psi vector from a given vector of positions [bohr] and a force constant matrix [Ry/bohr^2].
         Used to reset the psi after the symmetrization.
-       """
+        """
 
         new_v = np.einsum("a, ab->b",  np.sqrt(self.m) * vector, self.pols)
         
@@ -1246,20 +2222,52 @@ File {} not found. S norm not loaded.
         #print("out 0 (just end):", out_vect[0])
         return out_vect
 
+    
+    
     def apply_L1_FT(self, transpose = False):
-        """
+        r"""
         APPLY THE L1 AT FINITE TEMPERATURE
         ==================================
 
-        This is the first part of the application, it involves only harmonic propagation.
-
+        This is the first part of the application, it involves only HARMONIC propagation.
+        
+        NORMAL: this method applies -L_harm: 
+        :: math .
+            \begin{bmatrix}
+            -Z'' &   0  &  0 \\
+            0    &  -X  & -Y \\
+            0    &  -X' & -Y'
+            \end{bmatrix}
+        on the follwoing vector:
+        :: math .
+            \begin{bmatrix}
+            \mathcal{R}^{(1)} \\
+            \tilde{\Upsilon}^{(1)} \\
+            \Re \tilde{A}^{(1)}.
+            \end{bmatrix}
+            
+        WIGNER: this method applies +L_harm: 
+        :: math .
+            \begin{bmatrix}
+            - \omega^2_\alpha & 0 & 0 \\
+            0 &  -\omega^-_{\alpha\beta}^2  & 0 \\ 
+            0 & 0 &  -\omega^+_{\alpha\beta}^2 
+            \end{bmatrix}
+        on the following vector:
+        :: math .
+            \begin{bmatrix}
+            \tilde{\mathcal{R}}^{(1)}_\alpha\\ 
+            \tilde{a}'^{(1)}_{\alpha\beta}\\ 
+            \tilde{b}'^{(1)}_{\alpha\beta}.
+            \end{bmatrix}
+        
+        If transpose = True it applies the transpose.
+            
         Results
         -------
-            out_vect : ndarray(shape(self.psi))
+            -out_vect : ndarray(shape(self.psi))
                 It returns the application of the harmonic part of the L matrix
         """
-
-
         # Prepare the free propagator on the positions
         out_vect = np.zeros(np.shape(self.psi), dtype = TYPE_DP)
 
@@ -1279,10 +2287,19 @@ File {} not found. S norm not loaded.
 
         N_w2 = len(w_a)
 
-        # Get the harmonic responce function
-        out_vect[:self.n_modes] = (self.psi[:self.n_modes] * self.w) * self.w
+        ##############################################
+        # Get the harmonic responce function on R^(1)#
+        ##############################################
+        # Apply the diagonal free propagation 
+        if not self.use_wigner:
+#             print('[NORMAL]: harmonic R(1)')
+            out_vect[:self.n_modes] = (self.psi[:self.n_modes] * self.w) * self.w
+        else:
+            # Use Wigner
+#             print('[WIGNER]: harmonic R(1)')
+            out_vect[:self.n_modes] = -(self.psi[:self.n_modes] * self.w) * self.w
 
-
+        # Get the BE occupation number
         n_a = np.zeros(np.shape(w_a), dtype = TYPE_DP)
         n_b = np.zeros(np.shape(w_a), dtype = TYPE_DP)
         if self.T > 0:
@@ -1291,8 +2308,16 @@ File {} not found. S norm not loaded.
 
 
         # Apply the non interacting X operator
+        # Where R^(1) ends and Upsilon^(1)-a'^(1) starts
         start_Y = self.n_modes
+        # Where Upsilon^(1)-a'^(1) ends and ReA^(1)-b'^(1) starts
         start_A = self.n_modes + N_w2
+        
+        #########################################################################
+        # The R^(1) perturbation ends at start_Y
+        # The Upsilon^(1)/a'^{(1)} perturbation start at start_Y
+        # The ReA^(1)/b'^{(1)} perturbation starts at start_Y + 0.5*N_modes*(N_modes + 1)
+        #################################################################################
 
         #print("start_Y: {} | start_A: {} | end_A: {} | len_psi: {}".format(start_Y, start_A, start_A + N_w2, len(self.psi)))
 
@@ -1302,39 +2327,67 @@ The initial vector for the Lanczos algorithm has a wrong dimension.
 This may be caused by the Lanczos initialized at the wrong temperature.
 """
         assert len(self.psi) == start_A + N_w2, ERR_MSG
+        
+        ############################################################
+        # Get the harmonic responce function on Upsilon^(1)-a'^(1) #
+        ############################################################
+        
+        if not self.use_wigner:
+#             print('[NORMAL]: harmonic Y(1)')
+            # Apply the diagonal free propagation on Y
+            X_ab_NI = -w_a**2 - w_b**2 - (2*w_a *w_b) /((2*n_a + 1) * (2*n_b + 1))
+            out_vect[start_Y: start_A] = - X_ab_NI * self.psi[start_Y: start_A]
 
-        # Apply the free propagation
-        X_ab_NI = -w_a**2 - w_b**2 - (2*w_a *w_b) /( (2*n_a + 1) * (2*n_b + 1))
-        out_vect[start_Y: start_A] = - X_ab_NI * self.psi[start_Y: start_A]
+            # Apply the off diagonal free propagation Y-ReA
+            Y_ab_NI = - (8 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
+            if not transpose:
+                out_vect[start_Y : start_A] += - Y_ab_NI * self.psi[start_A: ]
+            else:
+                out_vect[start_A:] += - Y_ab_NI * self.psi[start_Y : start_A]
 
-        # Perform the same on the A side
-        Y_ab_NI = - (8 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
-        if not transpose:
-            out_vect[start_Y : start_A] += - Y_ab_NI * self.psi[start_A: ]
+            #L_operator[start_Y : start_A, start_A:] = - np.diag(Y_ab_NI) * extra_count
+            #L_operator[start_Y + np.arange(self.n_modes**2), start_A + exchange_frequencies] -=  Y_ab_NI / 2
         else:
-            out_vect[start_A:] += - Y_ab_NI * self.psi[start_Y : start_A]
+#             print('[WIGNER]: harmonic a(1)')
+            # Apply the diagonal free propagation in WIGNER on a'^{(1)}
+            a_harm = -(w_a**2 + w_b**2 - 2. * w_a * w_b)
+            out_vect[start_Y: start_A] = +a_harm * self.psi[start_Y: start_A]
+            
 
-        #L_operator[start_Y : start_A, start_A:] = - np.diag(Y_ab_NI) * extra_count
-        #L_operator[start_Y + np.arange(self.n_modes**2), start_A + exchange_frequencies] -=  Y_ab_NI / 2
+        ########################################################
+        # Get the harmonic responce function on ReA^(1)-b'^(1) #
+        ########################################################
+        
+        if not self.use_wigner:
+#             print('[NORMAL]: harmonic ReA(1)')
+            # Apply the off diagonal free propagation ReA-Y
+            X1_ab_NI = - (2*n_a*n_b + n_a + n_b) * (2*n_a*n_b + n_a + n_b + 1)*(2 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
 
-        X1_ab_NI = - (2*n_a*n_b + n_a + n_b) * (2*n_a*n_b + n_a + n_b + 1)*(2 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
+            # Apply the off-diagonal free propagation
+            if not transpose:
+                out_vect[start_A:] += - X1_ab_NI * self.psi[start_Y: start_A]
+            else:
+                out_vect[start_Y: start_A] += - X1_ab_NI * self.psi[start_A:]
+            #L_operator[start_A:, start_Y : start_A] = - np.diag(X1_ab_NI) / 1 * extra_count
+            #L_operator[start_A + np.arange(self.n_modes**2), start_Y + exchange_frequencies] -= X1_ab_NI / 2
 
-        if not transpose:
-            out_vect[start_A:] += - X1_ab_NI * self.psi[start_Y: start_A]
+            # Apply the diagonal free propagation ReA
+            Y1_ab_NI = - w_a**2 - w_b**2 + (2*w_a *w_b) /( (2*n_a + 1) * (2*n_b + 1))
+            out_vect[start_A:] += - Y1_ab_NI * self.psi[start_A:]
+            #L_operator[start_A:, start_A:] = -np.diag(Y1_ab_NI) / 1 * extra_count
+            #L_operator[start_A + np.arange(self.n_modes**2),  start_A + exchange_frequencies] -= Y1_ab_NI / 2
         else:
-            out_vect[start_Y: start_A] += - X1_ab_NI * self.psi[start_A:]
-        #L_operator[start_A:, start_Y : start_A] = - np.diag(X1_ab_NI) / 1 * extra_count
-        #L_operator[start_A + np.arange(self.n_modes**2), start_Y + exchange_frequencies] -= X1_ab_NI / 2
-
-        Y1_ab_NI = - w_a**2 - w_b**2 + (2*w_a *w_b) /( (2*n_a + 1) * (2*n_b + 1))
-        out_vect[start_A:] += - Y1_ab_NI * self.psi[start_A:]
-        #L_operator[start_A:, start_A:] = -np.diag(Y1_ab_NI) / 1 * extra_count
-        #L_operator[start_A + np.arange(self.n_modes**2),  start_A + exchange_frequencies] -= Y1_ab_NI / 2
-
+#             print('[WIGNER]: harmonic b(1)')
+            # Apply the diagonal free propagation in WIGNER on b'^{(1)}
+            b_harm = -(w_a**2 + w_b**2 + 2. * w_a * w_b)
+            out_vect[start_A:] = +b_harm * self.psi[start_A:]
 
         return out_vect
 
 
+    
+    
+    
     def apply_L1_inverse_FT(self, psi, transpose = False):
         """
         APPLY THE INVERSE L1 AT FINITE TEMPERATURE
@@ -1511,12 +2564,270 @@ Error, for the static calculation the vector must be of dimension {}, got {}
         out_vect[self.n_modes:] =  psi[self.n_modes:] / Lambda**power
 
         return out_vect
+    
+    
+    
+    
+    
+    def get_chi_minus(self):
+        r"""
+        Get the chi^- equilibrium tensor in the Wigner formalism.
+        
+        :: math .
+            \tilde{\chi}^{-}_{\mu\nu} = \frac{\hbar\left[\omega_\alpha - \omega_\beta\right]\left[n_\alpha - n_\beta\right]}{2\omega_\alpha\omega_\beta}
+            
+        Results:
+        -------
+            -chi_minus: chi minus tensor, np.array with shape = (n_modes, n_modes)
+        
+        """
+        # Prepare the result
+        chi_minus = np.zeros((self.n_modes, self.n_modes), dtype = np.double)
+        
+        # Create the matrix with freqeuncies
+        w = np.tile(self.w, (self.n_modes,1))
+        
+        # Create the Bose-Eninstein occupation number matrix
+        n = np.zeros((self.n_modes, self.n_modes), dtype = np.double)
+        
+        if self.T > __EPSILON__:
+            n = 1.0 / (np.exp(w * 157887.32400374097 /self.T) - 1.0)
+        
+        chi_minus = (w - w.T) * (n - n.T) /(2. * w * w.T)
+        
+        return chi_minus
+    
+    
+    def get_chi_plus(self):
+        r"""
+        Get the chi^+ equilibrium tensor in the Wigner formalism.
+        
+        :: math .
+            \tilde{\chi}^{+}_{\mu\nu} = \frac{\hbar\left[\omega_\alpha + \omega_\beta\right]\left[1 + n_\alpha + n_\beta\right]}{2\omega_\alpha\omega_\beta}
+            
+        Results:
+        -------
+            -chi_plus: chi plus tensor, np.array with shape = (n_modes, n_modes)
+        
+        """
+        # Prepare the result
+        chi_plus = np.zeros((self.n_modes, self.n_modes), dtype = np.double)
+        
+        # Create the matrix with freqeuncies
+        w = np.tile(self.w, (self.n_modes,1))
+        
+        # Create the Bose-Eninstein occupation number matrix
+        n = np.zeros((self.n_modes, self.n_modes), dtype = np.double)
+        
+        if self.T > __EPSILON__:
+            n = 1.0 / (np.exp(w * 157887.32400374097 /self.T) - 1.0)
+        
+        chi_plus = (w + w.T) * (1 + n + n.T) /(2. * w * w.T)
+        
+        return chi_plus
+    
+    
+    def get_a1_b1_wigner(self, get_a1 = True):
+        r"""
+        Get the the pertrubation on the a' matrix times sqrt(-0.5X^-) or on b' matrix
+        from the alpha and beta pertrubation.
+        
+        This function is to check the inverse of the change of variables.
+        
+        :: math .
+            \sqrt{-\frac{1}{2}\tilde{\chi}^-_{\mu\nu}} \tilde{a}'^{(1)}_{\mu\nu} = X_{\mu\nu} \cdot
+            \left[\frac{+1}{2}\left(\frac{\hbar^2}{\omega_{\mu} \omega_{\nu}}\tilde{\alpha}^{(1)}_{\mu\nu} 
+            + \tilde{\beta}^{(1)}_{\mu\nu}\right)\right];\\
+            
+        :: math .
+           \tilde{b}'^{(1)}_{\mu\nu} = \frac{X_{\mu\nu}}{\sqrt{\frac{1}{2}\tilde{\chi}^+_{\mu\nu}}} 
+           \left[\frac{-1}{2}
+           \left(\frac{\hbar^2}{\omega_{\alpha} \omega_{\beta}}\tilde{ \alpha}_{\mu\nu} 
+            - \tilde{ \beta}_{\mu\nu}\right)\right].;\\
+            
+        Parameters:
+        -----------
+            -get_a1: bool. If true we return the a' perturbation rescaled or the b' pertrubation
+        
+        Retruns:
+        -------
+            -a1: np.array with shape = n_modes * (n_modes + 1)/2
+        """ 
+        len_ = (self.n_modes * (self.n_modes + 1)) // 2
+        
+        # Get the beta1-alpha1 pertrubation as matrices, np.shape = (n_modes, n_modes)
+        alpha_mat_1 = self.get_alpha1_beta1_wigner(get_alpha = True)
+        beta_mat_1  = self.get_alpha1_beta1_wigner(get_alpha = False)
+        
+        # Now get alpha1 and beta1 as vectors
+        alpha1 = np.zeros(len_, dtype = np.double)
+        beta1  = np.zeros(len_, dtype = np.double)
+        
+        start = 0
+        next = self.n_modes
+        for i in range(self.n_modes):
+            # Get the sum of the rescaled tensor
+            alpha1[start : next] = alpha_mat_1[i, i:]
+            beta1[start : next]  = beta_mat_1[i, i:]
+            start = next 
+            next = start + self.n_modes - i - 1 
+           
+        # Get the independent indeces
+        # Avoid the exchange of w_a w_b
+        i_a = np.tile(np.arange(self.n_modes), (self.n_modes,1)).ravel()
+        i_b = np.tile(np.arange(self.n_modes), (self.n_modes,1)).T.ravel()
 
+        new_i_a = np.array([i_a[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        new_i_b = np.array([i_b[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        
+        # Get the independent indices
+        w_a = self.w[new_i_a]
+        w_b = self.w[new_i_b]
 
+        n_a = np.zeros(np.shape(len(w_a)), dtype = TYPE_DP)
+        n_b = np.zeros(np.shape(len(w_a)), dtype = TYPE_DP)
+        
+        if self.T > 0:
+            n_a = 1 / (np.exp( w_a / np.double(self.T / __RyToK__)) - 1)
+            n_b = 1 / (np.exp( w_b / np.double(self.T / __RyToK__)) - 1)
+            
+        # Get all the quantities to make the change of variables
+        X = ((1 + 2 * n_a) * (1 + 2 * n_b) /8)
+        w_a_b = (w_a * w_b)
+        chi_minus = ((w_a - w_b) * (n_a - n_b)) /(2 * w_a * w_b)
+        chi_plus  = ((w_a + w_b) * (1 + n_a + n_b)) /(2 * w_a * w_b)
+        
+        if get_a1:
+            a1 = np.zeros(len_, dtype = np.double)
+            a1 = 0.5 * X * (alpha1 / w_a_b + beta1)
+            
+            return a1
+        else:
+            b1 = -0.5 * X * (alpha1 /w_a_b - beta1)
+            b1 /= np.sqrt(0.5 * chi_plus)
 
+            return b1
+
+        
+
+    def get_alpha1_beta1_wigner(self, get_alpha = True):
+        r"""
+        Get the perturbation on the alpha/Upsilon or beta matrix from the psi vector in the Wigner formalism.
+        
+        Recall that alpha and beta are the starting free parameters of the Gaussian Wigner distribution.
+        
+        N.B.: This is the function that compute Upsilon^(1) matrix!
+        
+        :: math .
+            \tilde{\Upsilon}^{(1)}_{\mu\nu} = \tilde{\alpha}^{(1)}_{\mu\nu} =
+            \frac{\omega_\mu \omega_\nu}{\hbar^2 X_{\mu\nu}}
+            \left(
+            +\sqrt{-\frac{1}{2}\tilde{\chi}^-_{\mu\nu}} a'^{(1)}_{\mu\nu} 
+            -\sqrt{+\frac{1}{2}\tilde{\chi}^+_{\mu\nu}} b'^{(1)}_{\mu\nu}
+            \right) 
+            
+        :: math .
+            \tilde{\beta}^{(1)}_{\mu\nu} = 
+            \frac{1}{X_{\mu\nu}}
+            \left(
+             \sqrt{-\frac{1}{2}\tilde{\chi}^-_{\mu\nu}} a'^{(1)}_{\mu\nu} 
+            + \sqrt{\frac{1}{2}\tilde{\chi}^+_{\mu\nu}} b'^{(1)}_{\mu\nu}\right) 
+            
+        Parameters:
+        -----------
+            -get_alpha: bool, if True alpha1 is returned. If False beta1 is returned.
+            
+        Returns:
+        --------
+            -alpha1 or beta1: array with shape = (n_modes, n_modes)
+        """
+        # Where the arrays start
+        start_a = self.n_modes
+        start_b = self.n_modes +  (self.n_modes * (self.n_modes + 1)) // 2
+
+        # GET THE PERTURBED PARAMETERS a'^(1) and b'^(1)
+        a_all = self.psi[start_a : start_b]
+        b_all = self.psi[start_b :]
+        
+        # Get the independent indeces
+        # Avoid the exchange of w_a w_b
+        i_a = np.tile(np.arange(self.n_modes), (self.n_modes,1)).ravel()
+        i_b = np.tile(np.arange(self.n_modes), (self.n_modes,1)).T.ravel()
+
+        # Get the independent indeces
+        new_i_a = np.array([i_a[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        new_i_b = np.array([i_b[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        
+        # Get the independent freqeuncies
+        w_a = self.w[new_i_a]
+        w_b = self.w[new_i_b]
+
+        n_a = np.zeros(np.shape(len(w_a)), dtype = TYPE_DP)
+        n_b = np.zeros(np.shape(len(w_a)), dtype = TYPE_DP)
+        
+        if self.T > 0:
+            n_a = 1 / (np.exp( w_a / np.double(self.T / __RyToK__)) - 1)
+            n_b = 1 / (np.exp( w_b / np.double(self.T / __RyToK__)) - 1)
+        
+        # Get all the quantities to make the change of variables
+        X         = ((1 + 2 * n_a) * (1 + 2 * n_b) /8)
+        w2_on_X   = (w_a * w_b) / X
+        chi_minus = ((w_a - w_b) * (n_a - n_b)) /(2 * w_a * w_b)
+        chi_plus  = ((w_a + w_b) * (1 + n_a + n_b)) /(2 * w_a * w_b)
+        
+        if get_alpha:
+            # Now rescale a'^(1) 
+            new_a =  w2_on_X * np.sqrt(- 0.5 * chi_minus) * a_all
+            # Now rescale b'^(1)
+            new_b =  w2_on_X * np.sqrt(+ 0.5 * chi_plus)  * b_all
+
+            # Prepare the result
+            # This is Y(1)
+            alpha1 = np.zeros((self.n_modes, self.n_modes), dtype = np.double)
+
+            # Start filling
+            start = 0
+            next = self.n_modes
+            for i in range(self.n_modes):
+                # Get the difference of the rescaled tensor
+                alpha1[i, i:] = new_a[start : next] - new_b[start : next]
+                start = next 
+                next = start + self.n_modes - i - 1 
+
+                # Fill symmetric
+                alpha1[i, :i] = alpha1[:i, i]
+                
+            return alpha1      
+        else:
+            # Now rescale a'^(1) 
+            new_a =  (np.sqrt(- 0.5 * chi_minus) /X) * a_all
+            # Now rescale b'^(1)
+            new_b =  (np.sqrt(+ 0.5 * chi_plus)  /X) * b_all
+
+            # Prepare the result
+            beta1 = np.zeros( (self.n_modes, self.n_modes), dtype = np.double)
+
+            # Start filling
+            start = 0
+            next = self.n_modes
+            for i in range(self.n_modes):
+                # Get the sum of the rescaled tensor
+                beta1[i, i:] = new_a[start : next] + new_b[start : next]
+                start = next 
+                next = start + self.n_modes - i - 1 
+
+                # Fill symmetric
+                beta1[i, :i] = beta1[:i, i]
+
+            return beta1
+    
+    
+    
+   
     def get_Y1(self, half_off_diagonal = False):
         """
-        Get the perturbation on the Y matrix from the psi vector
+        Get the perturbation on the Y matrix from the psi vector.
+        This is used in the standard code.
         """
         start_Y = self.n_modes
         start_A = self.n_modes +  (self.n_modes * (self.n_modes + 1)) // 2
@@ -1524,6 +2835,7 @@ Error, for the static calculation the vector must be of dimension {}, got {}
         Y_all = self.psi[start_Y : start_A]
 
         Y1 = np.zeros( (self.n_modes, self.n_modes), dtype = np.double)
+        
         start = 0
         next = self.n_modes
         for i in range(self.n_modes):
@@ -1577,59 +2889,119 @@ Error, for the static calculation the vector must be of dimension {}, got {}
 
 
     def apply_anharmonic_FT(self, transpose = False, test_weights = True, use_old_version = False):
-        """
+        r"""
         APPLY ANHARMONIC EVOLUTION
         ==========================
 
         This term involves the anharmonic evolution:
-        This calculates self-consistently the evolution from the vector.
-
-
+        This calculates self-consistently the anharmonic evolution from the vector.
+        
+        NORMAL: this method applies -L_anharm (see Eq. (K4) in the Appendix of the Monacelli PRB): 
+        :: math .
+            \begin{bmatrix}
+             0   &  -X''  &  0 \\
+            -Z   &  -X    & 0 \\
+            -Z'  &  -X'   & 0
+            \end{bmatrix}
+        on the follwoing vector:
+        :: math .
+            \begin{bmatrix}
+            \mathcal{R}^{(1)} \\
+            \tilde{\Upsilon}^{(1)} \\
+            \Re \tilde{A}^{(1)}.
+            \end{bmatrix}
+        
+        WIGNER: this method applies +L_anh:
+        :: math.
+            \mathcal{L}_{anh} 
+            \begin{bmatrix}
+            \tilde{\mathcal{R}}^{(1)}_\mu\\ \\
+            \tilde{a}'^{(1)}_{\mu\nu}\\ \\
+            \tilde{b}'^{(1)}_{\mu\nu}
+            \end{bmatrix} 
+            = 
+            \begin{bmatrix}
+            -\left\langle \frac{\partial \mathbb{V}}{\partial \tilde{Q}_\alpha}\right\rangle_{(1)}\\ \\
+            +\sqrt{-\frac{1}{2}\tilde{\chi}_{\alpha\beta}^{-}}
+            \left\langle \frac{\partial^2 \mathbb{V}}{\partial \tilde{Q}_\alpha \partial \tilde{Q}_\beta}\right\rangle_{(1)}\\ \\
+            -\sqrt{\frac{1}{2}\tilde{\chi}_{\alpha\beta}^{+}}
+            \left\langle \frac{\partial^2 \mathbb{V}}{\partial \tilde{Q}_\alpha \partial \tilde{Q}_\beta}\right\rangle_{(1)}
+            \end{bmatrix}
+        
         Parameters
         ----------
-            transpose : bool
+            -transpose : bool
                 If True, the transpose of L is computed.
-            test_weights : bool
+            -test_weights : bool
                 If True, the weights are tested against those computed with finite differences
                 It is time consuming, activate only for debugging
-            use_old_version: bool
+            -use_old_version: bool
                 If true, it employes an old version of the subroutine that does not satisfy the permutation symmetry.
                 Use this option only for testing purpouses.
+                
+        Results:
+        -------
+            -final_psi: np.array with shape = n_modes + n_modes * (n_modes + 1)
         """
         #print("Starting with psi:", self.psi)
-
-        Y1 = self.get_Y1(half_off_diagonal = transpose)
+        
+        # Get the perturbation R^(1)
         R1 = self.psi[: self.n_modes]
+        
+        if not self.use_wigner:
+#             print('[NORMAL]: get Y(1)')
+            # Get the perturbation Upsilon^(1)
+            Y1 = self.get_Y1(half_off_diagonal = transpose)
+        else:
+#             print('[WIGNER]: get Y(1)')
+            # Use the Wigner equations
+            # Upsilon^(1) = alpha^(1)
+            Y1 = self.get_alpha1_beta1_wigner(get_alpha = True)
 
+        # Weights to perform the pertrubed average
         weights = np.zeros(self.N, dtype = np.double)
 
+        if not self.use_wigner:
+#             print('[NORMAL]: get static egivals')
+            # The standard code
+            # Create the multiplicative matrices for the rest of the anharmonicity
+            n_mu = 0
+            if self.T > __EPSILON__:
+                n_mu = 1.0 /(np.exp(self.w * 157887.32400374097 / self.T) - 1.0)
+            # Eigenvalues of Upsilon and ReA at equilibrium
+            Y_w   = 2 * self.w / (2 * n_mu + 1)
+            ReA_w = 2 * self.w * n_mu * (n_mu + 1) / (2*n_mu + 1)
 
-        # Create the multiplicative matrices for the rest of the anharmonicity
-        n_mu = 0
-        if self.T > __EPSILON__:
-            n_mu = 1.0 / ( np.exp(self.w * 157887.32400374097 / self.T) - 1.0)
-        Y_w = 2 * self.w / (2 * n_mu + 1)
-        ReA_w = 2 * self.w * n_mu * (n_mu + 1) / (2*n_mu + 1)
+            # Check if we must compute the transpose
+            if transpose:
+                ReA1 = self.get_ReA1(half_off_diagonal = transpose)
 
-        # Check if we must compute the transpose
-        if transpose:
-            ReA1 = self.get_ReA1(half_off_diagonal = transpose)
+                # The equation is
+                # Y^(1)_new = 2 Ya Yb^2 Y^(1) + 2 Yb Ya^2 Y^(1)
+                coeff_Y = np.einsum("a, b, b -> ab", Y_w, Y_w, Y_w)
+                coeff_Y += np.einsum("a, a, b -> ab", Y_w, Y_w, Y_w)
+                coeff_Y *= 2
 
-            # The equation is
-            # Y^(1)_new = 2 Ya Yb^2 Y^(1) + 2 Yb Ya^2 Y^(1)
-            coeff_Y = np.einsum("a, b, b -> ab", Y_w, Y_w, Y_w)
-            coeff_Y += np.einsum("a, a, b -> ab", Y_w, Y_w, Y_w)
-            coeff_Y *= 2
+                coeff_RA = np.einsum("a, b, b -> ab", Y_w, ReA_w, Y_w)
+                coeff_RA += np.einsum("a, a, b -> ab", Y_w, ReA_w, Y_w)
+                coeff_RA *= 2
 
-            coeff_RA = np.einsum("a, b, b -> ab", Y_w, ReA_w, Y_w)
-            coeff_RA += np.einsum("a, a, b -> ab", Y_w, ReA_w, Y_w)
-            coeff_RA *= 2
+                # Get the new perturbation
+                Y1_new = Y1 * coeff_Y + ReA1 * coeff_RA
 
-            # Get the new perturbation
-            Y1_new = Y1 * coeff_Y + ReA1 * coeff_RA
-
-            # Override the old perturbation
-            Y1 = Y1_new
+                # Override the old perturbation
+                Y1 = Y1_new    
+        else:
+#             print('[WIGNER]: get static egivals')
+            # We are using Wigner equations
+            # Get the chi +/- array (n_modes, n_modes)
+            chi_minus = self.get_chi_minus()
+            chi_plus  = self.get_chi_plus()
+            
+#             print('chi_minus = ')
+#             print(chi_minus)
+#             print('chi plus = ')
+#             print(chi_plus)
 
 
         #print("X:", self.X)
@@ -1638,14 +3010,20 @@ Error, for the static calculation the vector must be of dimension {}, got {}
         #print("Y1:", Y1)
         #print("T:", self.T)
 
-        # Compute the average SSCHA force and potential
-        f_pert_av = np.zeros(self.n_modes, dtype = np.double)
+        # Compute the perturbed average of BO potential in the polarization basis
+        f_pert_av   = np.zeros(self.n_modes, dtype = np.double)
         d2v_pert_av = np.zeros((self.n_modes, self.n_modes), dtype = np.double, order = "C")
 
         # Check if you need to compute the fourth order
         apply_d4 = 1
         if self.ignore_v4:
+            print('Removing D4')
             apply_d4 = 0
+            
+        # NEW: we can remove the D3 effect
+        if self.ignore_v3:
+            print('Removing D3')
+            R1[:] = 0.
 
         # Prepare the symmetry variables for the C code
         # deg_space_new = np.zeros(np.sum(self.N_degeneracy), dtype = np.intc)
@@ -1663,51 +3041,50 @@ Error, for the static calculation the vector must be of dimension {}, got {}
         #         j_mode = 0
 
 
-        # Compute the perturbed averages (the time consuming part is HERE)
+        # Compute the perturbed averages (the time consuming part is HERE !!!)
         #print("Entering in get pert...")
         n_syms, _, _ = np.shape(self.symmetries[0])
         #print("DEG:")
         #print(self.degenerate_space)
+        
+        # OLD Implementation still working
         if self.mode in (MODE_FAST_MPI, MODE_FAST_SERIAL): 
+            # Get the pertrubed averages
             sscha_HP_odd.GetPerturbAverageSym(self.X, self.Y, self.w, self.rho, R1, Y1, self.T, apply_d4, n_syms,
-                                            self.symmetries, self.N_degeneracy, self.degenerate_space ,self.sym_block_id, 
-                                            f_pert_av, d2v_pert_av)
+                                              self.symmetries, self.N_degeneracy, self.degenerate_space ,self.sym_block_id, 
+                                              f_pert_av, d2v_pert_av)
+        
         elif self.mode == MODE_FAST_JULIA:
             if not __JULIA_EXT__:
                 raise ImportError("Error while importing julia. Try with python-jl after pip install julia.")
-            
+                
             if self.sym_julia is None:
-                MSG="""
-Error, the initialization must be called AFTER you change mode to JULIA.
-"""
+                MSG = "Error, the initialization must be called AFTER you change mode to JULIA."
                 raise ValueError(MSG)
-
-
+                
+                
             # Prepare the parallelization function
             def get_f_proc(start_end):
                 start = int(start_end[0])
-                end = int(start_end[1])
+                end   = int(start_end[1])
                 #Parallel.all_print("Processor {} is doing:".format(Parallel.get_rank()), start_end)
-                f_pert_av = julia.Main.get_perturb_f_averages_sym(self.X.T, self.Y.T, self.w, self.rho, R1, Y1, np.float64(self.T), bool(apply_d4),
-                                                self.sym_julia, self.N_degeneracy, self.deg_julia ,self.sym_block_id, start, end)
-                
+                f_pert_av = julia.Main.get_perturb_f_averages_sym(self.X.T, self.Y.T, self.w, self.rho, R1, Y1, np.float64(self.T), bool(apply_d4),\
+                                                                  self.sym_julia, self.N_degeneracy, self.deg_julia ,self.sym_block_id, start, end)
                 return f_pert_av
             def get_d2v_proc(start_end):
                 start = int(start_end[0])
-                end = int(start_end[1])
-                d2v_dr2 = julia.Main.get_perturb_d2v_averages_sym(self.X.T, self.Y.T, self.w, self.rho, R1, Y1, np.float64(self.T), bool(apply_d4),
-                                                self.sym_julia, self.N_degeneracy, self.deg_julia ,self.sym_block_id, start, end)
-                
+                end   = int(start_end[1])
+                d2v_dr2 = julia.Main.get_perturb_d2v_averages_sym(self.X.T, self.Y.T, self.w, self.rho, R1, Y1, np.float64(self.T), bool(apply_d4),\
+                                                                  self.sym_julia, self.N_degeneracy, self.deg_julia ,self.sym_block_id, start, end)
                 return d2v_dr2
-
-            # Divide the configurations and symmetries on different processors
-            # (Here we get the range of work for each process)
+            
+            # Divide the configurations and symmetries on different processors (Here we get the range of work for each process)
             n_total = self.n_syms * self.N 
-
             n_processors = Parallel.GetNProc()
             count = n_total // n_processors
             remainer = n_total % n_processors
-
+            
+            # Assign which configurations should be computed by each processor
             indices = []
             for rank in range(n_processors):
 
@@ -1717,24 +3094,34 @@ Error, the initialization must be called AFTER you change mode to JULIA.
                 else:
                     start = np.int64(rank * count + remainer) 
                     stop = np.int64(start + count) 
+
+                indices.append([start + 1, stop])
+
                 
-                indices.append( [start + 1, stop])
-        
             # Execute the get_f_d2v_proc on each processor in parallel.
-            f_pert_av = Parallel.GoParallel(get_f_proc, indices, "+")
+            f_pert_av   = Parallel.GoParallel(get_f_proc, indices, "+")
             d2v_pert_av = Parallel.GoParallel(get_d2v_proc, indices, "+")
+
         else:
             raise ValueError("Error, mode running {} not implemented.".format(self.mode))
 
+
+            
+              
+        # OLD PART OF THE CODE
         #print("D2V:")
         #np.set_printoptions(threshold = 10000)
         #print(d2v_pert_av[:10, :10])#print("Out get pert")
 
-        #print("<f> pert = {}".format(f_pert_av))
-        #print("<d2v/dr^2> pert = {}".format(d2v_pert_av))
-        #print()
+#         print("R1 = {}".format(R1))
+#         print("Y1 = {}".format(Y1))
+#         print("<f> pert = {}".format(f_pert_av))
+#         print("<d2v/dr^2> pert = {}".format(d2v_pert_av))
+#         print("<d2v/dr^2>T pert = {}".format(d2v_pert_av.T))
+#         print("<d2v/dr^2>T - <d2v/dr^2>  pert = {}".format(d2v_pert_av.T - d2v_pert_av))
+#         print()
 
-        # Compute the average with the old version
+        # Compute the average with the OLD VERSION
         if use_old_version:
             # Get the weights of the perturbation (psi vector)
             sscha_HP_odd.GetWeights(self.X, self.w, R1, Y1, self.T, weights)
@@ -1805,43 +3192,77 @@ Error, the initialization must be called AFTER you change mode to JULIA.
             #print("<f> pert = {}".format(f_pert_av))
             #print("<d2v/dr^2> pert = {}".format(d2v_pert_av))
             #print()
+        
+        # END OF THE OLD VERSION
 
-
+        
         # Get the final vector
         final_psi = np.zeros(self.psi.shape, dtype = np.double)
+        
+        # Now get the perturbation for R^(1) (same in Wigner)
         final_psi[:self.n_modes] =  f_pert_av
 
-        if not transpose:
-            # Get the perturbation on Y and Re A
-            pert_Y = np.einsum("ab, a ->ab", d2v_pert_av, Y_w)
-            pert_Y += np.einsum("ab, b -> ab", d2v_pert_av, Y_w)
+        if not self.use_wigner:
+#             print('[NORMAL]: anharmonic Y(1) ReA(1)')
+            # Propagation for Upsilon^(1) and ReA^(1)
+            if not transpose:
+                # Get the perturbation D2 * Upsilon + Upsilon * D2
+                pert_Y  = np.einsum("ab, a ->ab", d2v_pert_av, Y_w)
+                pert_Y += np.einsum("ab, b ->ab", d2v_pert_av, Y_w)
 
-            pert_RA = np.einsum("ab, a ->ab", d2v_pert_av, ReA_w)
-            pert_RA += np.einsum("ab, b -> ab", d2v_pert_av, ReA_w)
+                # Get the perturbation D2 * Re A +  Re A * D2
+                pert_RA  = np.einsum("ab, a ->ab", d2v_pert_av, ReA_w)
+                pert_RA += np.einsum("ab, b -> ab", d2v_pert_av, ReA_w)
+            else:
+                Y_inv = 1 / Y_w
+                pert_Y = 0.5 * np.einsum("a, ab, b -> ab", Y_inv, d2v_pert_av, Y_inv)
+                pert_RA = np.zeros(pert_Y.shape, dtype = np.double)
+
+                # Now double the off diagonal values of pert_Y and pert_RA
+                # This is to take into account the symmetric storage of psi
+                sym_mask = np.ones(pert_Y.shape) * 2 
+                np.fill_diagonal(sym_mask, 1) 
+                pert_Y  *= sym_mask 
+                pert_RA *= sym_mask
         else:
-            Y_inv = 1 / Y_w
-            pert_Y = 0.5 * np.einsum("a, ab, b -> ab", Y_inv, d2v_pert_av, Y_inv)
-            pert_RA = np.zeros(pert_Y.shape, dtype = np.double)
-
-            # Now double the off diagonal values of pert_Y and pert_RA
-            # This is to take into account the symmetric storage of psi
-            sym_mask = np.ones(pert_Y.shape) * 2 
-            np.fill_diagonal(sym_mask, 1) 
-            pert_Y *= sym_mask 
-            pert_RA *= sym_mask
-
-
-        # Now get the perturbation on the vector
+#             print("[WIGNER]: anharmonic a(1)' b(1)'")
+            # We are using Wigner equations
+            # Propagation for a'^(1)
+            pert_Y  = np.einsum('ab, ab -> ab', +np.sqrt(-0.5 * chi_minus), d2v_pert_av)
+            # Propagation for b'^(1)
+            pert_RA = np.einsum('ab, ab -> ab', -np.sqrt(+0.5 * chi_plus),  d2v_pert_av)
+        
+            
+#         print('pert_R = ')
+#         print(f_pert_av)
+#         print('pert_RA = ')
+#         print(pert_RA)
+            
+        #####################
+        # Update the vector #
+        #####################
+        
+        # Note: the code deals with symmetric matrices in the following way.
+        # Given a matrix you take the row on the right from the (1,1) element,
+        # then you take the row on the right from the (2,2) element,
+        # then you proceed with the (3,3) element.
+        
+        # Now get the perturbation for Upsilon^(1)/a'^(1)
         current = self.n_modes
         for i in range(self.n_modes):
             final_psi[current : current + self.n_modes - i] = pert_Y[i, i:]
             current = current + self.n_modes - i
+            
+#         print('final psi = ')
+#         print(final_psi)
 
-        # Now process the RA
+        # Now process the pertrubation of ReA^(1)/b'^(1)
         for i in range(self.n_modes):
             final_psi[current : current + self.n_modes - i] = pert_RA[i, i:]
             current = current + self.n_modes - i
-
+            
+#         print('final psi = ')
+#         print(final_psi)
 
         # print("First element of pert_Y:", pert_Y[0,0])
         # print("Y_w = ", Y_w)
@@ -1851,9 +3272,17 @@ Error, the initialization must be called AFTER you change mode to JULIA.
         # print("Final psi:")
         # print(final_psi[self.n_modes: self.n_modes + 10])
 
-
         #print("Output:", final_psi)
-        return -final_psi
+        if not self.use_wigner:
+#             print('[NORMAL]: anharmonic final')
+            return -final_psi
+        else:
+#             print('[WIGNER]: anharmonic final')
+            return +final_psi
+        
+        
+        
+        
 
     def apply_anharmonic_static(self):
         """
@@ -1929,7 +3358,6 @@ Error, the initialization must be called AFTER you change mode to JULIA.
 
         if self.ignore_v3:
             return np.zeros(np.shape(self.psi), dtype = TYPE_DP)
-
 
 
         w_a = np.tile(self.w, (self.n_modes, 1)).ravel()
@@ -2036,14 +3464,14 @@ Error, the initialization must be called AFTER you change mode to JULIA.
 
         return simple_output
 
-    def apply_full_L(self, target=None, force_t_0 = False, force_FT = True, transpose = False, fast_lanczos = True):
+    def apply_full_L(self, target = None, force_t_0 = False, force_FT = True, transpose = False, fast_lanczos = True):
         """
         APPLY THE L 
         ===========
 
         This function applies the L operator to the specified target vector.
         The target vector is first copied into the local psi, and the computed.
-        This function will overwrite the current psi with the specified
+        NOTE: This function will overwrite the current psi with the specified
         target.
 
         Parameters
@@ -2061,9 +3489,16 @@ Error, the initialization must be called AFTER you change mode to JULIA.
             fast_lanczos : bool
                 If true this method applies the L2 and L3 using the self-consistent way.
                 This is much quicker, but needs to be tested
+            transpose : bool
+                Default is False, if it is true we apply the transpose
+            fast_lanczos : bool
+                See force_t_0 for details.
+                
+        Returns:
+        -------
+            -self.psi: the updated vector
 
         """
-
         if force_t_0 and force_FT:
             raise ValueError("Error, only one between force_t_0 and force_FT can be True")
 
@@ -2085,27 +3520,32 @@ Error, the initialization must be called AFTER you change mode to JULIA.
         # Apply the whole L step by step to self.psi
         t1 = timer()
         if (force_t_0 or self.T < __EPSILON__) and not force_FT:
+            # Harmonic evolution
             output = self.apply_L1()
         else:
+            #HARMONIC evolution at finite temperature
             output = self.apply_L1_FT(transpose)
         t2 = timer()
 
-        # Apply the quck_lanczos
+        # Apply the quick_lanczos
+        t4 = timer()
         if fast_lanczos and (not self.ignore_v3):
+            print('Applying the anharmonic part of L')
+            # AN-HARMONIC evolution finite temperature
             output += self.apply_anharmonic_FT(transpose)
             t3 = timer()
             t4 = t3
-        else:
-            if (force_t_0 or self.T < __EPSILON__) and not force_FT:
-                output += self.apply_L2()
-            else:
-                output += self.apply_L2_FT(transpose)
-            t3 = timer()
-            if (force_t_0 or self.T < __EPSILON__) and not force_FT:
-                output += self.apply_L3()
-            else:
-                output += self.apply_L3_FT(transpose)
-            t4 = timer()
+        # else:
+        #     if (force_t_0 or self.T < __EPSILON__) and not force_FT:
+        #         output += self.apply_L2()
+        #     else:
+        #         output += self.apply_L2_FT(transpose)
+        #     t3 = timer()
+        #     if (force_t_0 or self.T < __EPSILON__) and not force_FT:
+        #         output += self.apply_L3()
+        #     else:
+        #         output += self.apply_L3_FT(transpose)
+        #     t4 = timer()
 
         if self.verbose:
             print("Time to apply the full L: {}".format(t4 - t1))
@@ -2198,7 +3638,13 @@ Error, the initialization must be called AFTER you change mode to JULIA.
                                 arnoldi_matrix = self.arnoldi_matrix,
                                 reverse = self.reverse_L,
                                 shift = self.shift_value,
-                                perturbation_modulus = self.perturbation_modulus)
+                                perturbation_modulus = self.perturbation_modulus,
+                                use_wigner = self.use_wigner,
+                                ignore_small_w = self.ignore_small_w,
+                                sym_julia = self.sym_julia,
+                                deg_julia = self.deg_julia,
+                                n_syms = self.n_syms)
+
             
     def load_status(self, file, is_file_instance = False):
         """
@@ -2257,12 +3703,33 @@ Error, the initialization must be called AFTER you change mode to JULIA.
         self.b_coeffs = data["b_coeffs"]
         if "c_coeffs" in data:
             self.c_coeffs = data["c_coeffs"]
+        # Make them as lists
+        self.a_coeffs = list(self.a_coeffs)
+        self.b_coeffs = list(self.b_coeffs)
+        self.c_coeffs = list(self.c_coeffs)
         self.krilov_basis = data["krilov_basis"]
         self.arnoldi_matrix = data["arnoldi_matrix"]
+        
+        try:
+            self.sym_julia = data["sym_julia"]
+            self.deg_julia = data["deg_julia"]
+            self.n_syms = data["n_syms"]
+        except:
+            print('ATTENTION THE JULIA VARIABLES  WERE NOT LOADED')
+            self.sym_julia = None
+            self.deg_julia = None
+            self.n_syms = 1
+            
 
         self.basis_Q = data["basis_Q"]
         self.basis_P = data["basis_P"]
         self.s_norm = data["s_norm"]
+        
+        self.use_wigner = data["use_wigner"]
+        try:
+            self.ignore_small_w = data["ignore_small_w"]
+        except:
+            self.ignore_small_w = False #data["ignore_small_w"]
 
         if "reverse" in data.keys():
             self.reverse_L = data["reverse"]
@@ -2276,21 +3743,23 @@ Error, the initialization must be called AFTER you change mode to JULIA.
         
         if "perturbation_modulus" in data.keys():
             self.perturbation_modulus = data["perturbation_modulus"]
-            #self.q_vectors = data["q_vectors"]
 
+        
         # Prepare the L as a linear operator (Prepare the possibility to transpose the matrix)
         def L_transp(psi):
             return self.apply_full_L(psi, transpose= True)
-        self.L_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)), matvec = self.apply_full_L, rmatvec = L_transp, dtype = TYPE_DP)
+        self.L_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)),\
+                                                          matvec = self.apply_full_L, rmatvec = L_transp, dtype = TYPE_DP)
 
         # Define the preconditioner
         def M_transp(psi):
             return self.apply_L1_inverse_FT(psi, transpose = True)
-        self.M_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)), matvec = self.apply_L1_inverse_FT, rmatvec = M_transp, dtype = TYPE_DP)
+        self.M_linop = scipy.sparse.linalg.LinearOperator(shape = (len(self.psi), len(self.psi)),\
+                                                          matvec = self.apply_L1_inverse_FT, rmatvec = M_transp, dtype = TYPE_DP)
 
 
     def run_biconjugate_gradient(self, verbose = True, tol = 5e-4, maxiter = 1000, save_g = None, save_each = 1, use_preconditioning = True, algorithm = "bicgstab"):
-        r"""
+        """
         STATIC RESPONSE
         ===============
 
@@ -3153,10 +4622,10 @@ Max number of iterations: {}
         Parameters
         ----------
             w_array : ndarray
-                The list of frequencies for which you want to compute the
+                The list of frequencies in RY for which you want to compute the
                 dynamical green function.
             smearing : float
-                The smearing to take a non zero imaginary part.
+                The smearing in RY to take a non zero imaginary part.
             v_a : ndarray(size = 3*self.nat)
                 The perturbation operator (on atomic positions)
             v_b : ndarray(size = 3*self.nat)
@@ -3479,8 +4948,8 @@ Max number of iterations: {}
         return -np.imag(spectral)
 
 
-    def get_green_function_continued_fraction(self, w_array, use_terminator : bool = True, last_average: int = 1, smearing : np.float64 = 0):
-        """
+    def get_green_function_continued_fraction(self, w_array : np.ndarray[np.float64], use_terminator : bool = True, last_average: int = 1, smearing : np.float64 = 0):
+        r"""
         CONTINUED FRACTION GREEN FUNCTION
         =================================
 
@@ -3488,53 +4957,354 @@ Max number of iterations: {}
         This should converge faster than the Lenmann representation, and
         has the advantage of adding the possibility to add a terminator.
         This avoids to define a smearing.
+        
+        NORMAL: we invert:
+        :: math .
+            <p|(-\mathcal{L} - \omega^2)^{-1}|q>,
+        
+        WIGNER: we invert:
+        :: math .
+            <p|(\mathcal{L}_w + \omega^2)^{-1}|q>
+            
+        So in the continued fraction we have -/+ in front of the freqeuncy depending on the formalism used.
 
         Parameters
         ----------
             w_array : ndarray
-                The list of frequencies in which you want to compute the green function
+                The list of frequencies in RY in which you want to compute the green function
             use_terminator : bool
                 If true (default) a standard terminator is used.
             last_average : int
-                How many a and be coefficients are averaged to evaluate the terminator?
+                How many a and b coefficients are averaged to evaluate the terminator?
             smearing : float
-                The smearing parameter. If none
+                The smearing parameter in RY. If none
         """
-
         n_iters = len(self.a_coeffs)
 
         gf = np.zeros(np.shape(w_array), dtype = np.complex128)
-
-        sign =1
+        
+        sign = 1
         if self.reverse_L:
             sign = -1
+            
+        INFO = """
+GREEN FUNCTION FROM CONTINUED FRACTION
+Am I using Wigner? {}
+Should I use the terminator? {}
+Perturbation modulus = {}
+Sign = {}""".format(self.use_wigner, use_terminator, self.perturbation_modulus, sign)
+        
+        print()
+        print(INFO)
 
         # Get the terminator
         if use_terminator:
+            # Get the last coeffs averaging
             a_av = np.mean(self.a_coeffs[-last_average:])
             b_av = np.mean(self.b_coeffs[-last_average:])
             c_av = b_av
-            if len(self.c_coeffs) == len(self.b_coeffs): # Non-symmetric Lanczos
+            # Non-symmetric Lanczos
+            if len(self.c_coeffs) == len(self.b_coeffs):
                 c_av = np.mean(self.c_coeffs[-last_average:])
 
             a = a_av * sign - sign* self.shift_value
             b = b_av * sign
             c = c_av * sign
-
-            gf[:] = (a - w_array**2 - np.sqrt( (a - w_array**2)**2 - 4*b*c + 0j))/(2*b*c)
+            
+            if not self.use_wigner:
+                gf[:] = (a - w_array**2 - np.sqrt( (a - w_array**2)**2 - 4*b*c + 0j))/(2*b*c)
+            else:
+                # Wigner
+                gf[:] = (a + w_array**2 + np.sqrt( (a + w_array**2)**2 - 4*b*c + 0j))/(2*b*c)        
         else:
+            # If we do not use the Terminator we get the last fraction
             a = self.a_coeffs[-1] * sign - sign* self.shift_value
-            gf[:] = 1/ (a - w_array**2 + 2j*w_array*smearing)
+            if not self.use_wigner:
+                gf[:] = 1/ (a - w_array**2 + 2j*w_array*smearing)
+            else:
+                # Wigner
+                gf[:] = 1/ (a + w_array**2 + 2j*w_array*smearing)
 
+        # Continued fraction
         for i in range(n_iters-2, -1, -1):
-            a = self.a_coeffs[i] * sign - sign* self.shift_value
+            # Start getting the continued fraction from the last coeff
+            a = self.a_coeffs[i] * sign - sign * self.shift_value
             b = self.b_coeffs[i] * sign
             c = b
-            if len(self.c_coeffs) == len(self.b_coeffs): # Non-symmetric Lanczos
+            if len(self.c_coeffs) == len(self.b_coeffs): 
                 c = self.c_coeffs[i] * sign
-            gf = 1. / (a - w_array**2  + 2j*w_array*smearing - b*c * gf)
+               
+            if not self.use_wigner:
+                gf = 1. / (a - w_array**2  + 2j*w_array*smearing - b * c * gf)
+            else:
+                # In Wigner we invert L + omega^2
+                gf = 1. / (a + w_array**2  + 2j*w_array*smearing - b * c * gf)
+         
+        if not self.use_wigner:
+            return gf * self.perturbation_modulus
+        else:
+            # Wigner
+            return (-np.real(gf) + 1j * np.imag(gf)) * self.perturbation_modulus
 
-        return gf * self.perturbation_modulus
+
+        
+           
+    def get_full_L_debug_wigner(self, verbose = False, debug_d3 = None, symmetrize = True, overwrite_L_operator = True):
+        """
+        GET THE FULL L OPERATOR FOR DEBUG WIGNER
+        ========================================
+        Use this method to test if the change of variables that defines the symmetric Wigner representation works.
+        
+        Note: make sure that self.use_wigner is Fasle so when we compute the Green function
+        we get the correct sign in front of omega in the contnued fraction.
+        
+        DO NOT USE FOR PRODUCTION: IT IS DANGEROUS
+
+        Results
+        -------
+           L_op : ndarray(size = (nmodes * (2*nmodes + 1)), dtype = TYPE_DP)
+              The full L operator.
+        """
+        if self.use_wigner:
+            raise ErrorValue('Please make sure that use_wigner is False')
+            
+        # Avoid the dependent freqeuncies
+        i_a = np.tile(np.arange(self.n_modes), (self.n_modes,1)).ravel()
+        i_b = np.tile(np.arange(self.n_modes), (self.n_modes,1)).T.ravel()
+
+        new_i_a = np.array([i_a[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        new_i_b = np.array([i_b[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        
+        w_a = self.w[new_i_a]
+        w_b = self.w[new_i_b]
+        
+        # N_w2 is the number of independent indeces
+        N_w2 = len(w_a)
+
+        if verbose:
+            print()
+            print('Getting the DEBUG WIGNER L operator')
+        # Prepare the operator
+        L_operator = np.zeros(shape = (self.n_modes + 2*N_w2, self.n_modes + 2*N_w2), dtype = TYPE_DP)
+            
+
+        n_a = np.zeros(np.shape(w_a), dtype = TYPE_DP)
+        n_b = np.zeros(np.shape(w_a), dtype = TYPE_DP)
+        if self.T > 0:
+            n_a = 1 / (np.exp(w_a * 157887.32400374097/self.T) - 1)
+            n_b = 1 / (np.exp(w_b * 157887.32400374097/self.T) - 1)
+
+        if verbose:
+            print("BE occ number", n_a[:self.n_modes])
+
+        # Apply the non interacting X operator
+        start_Y = self.n_modes
+        start_A = self.n_modes + N_w2
+
+        if not self.ignore_harmonic:
+            if verbose:
+                print('DEBUG WIGNER harmonic R(1) a(1) b(1)')
+            # Harmonic evolution for R -> R sector
+            L_operator[:self.n_modes, :self.n_modes] = +np.diag(self.w**2)
+            
+            # Harmonic evolution for a -> a sector
+            a_a = w_a**2 + w_b**2 - 2 * w_a * w_b
+            L_operator[start_Y: start_A, start_Y: start_A] = +np.diag(a_a)
+
+            # Harmonic evolution for b -> b sector
+            b_b = w_a**2 + w_b**2 + 2 * w_a * w_b
+            L_operator[start_A:, start_A:] = +np.diag(b_b)
+                
+
+        # We ADDED all the non interacting (harmonic) propagators both for debug Wigner
+        # In Wigner the Harmonic approach is working
+
+        # Compute the d3 operator
+        if debug_d3 is None:
+            N_eff = np.sum(self.rho)
+            Y_weighted = np.einsum("ia, i -> ia", self.Y, self.rho)
+        if not self.ignore_v3:
+            if verbose:
+                print("Computing d3...")
+            if not debug_d3 is None:
+                d3 = debug_d3
+            else:
+                X_ups = np.einsum("ia, a -> ia", self.X, f_ups(self.w, self.T))
+
+                d3_noperm = np.einsum("ia, ib, ic -> abc", X_ups, X_ups, Y_weighted)
+                d3_noperm /= -N_eff 
+
+                # Apply the permuatations
+                d3 = d3_noperm.copy()
+                d3 += np.einsum("abc->acb", d3_noperm)
+                d3 += np.einsum("abc->bac", d3_noperm)
+                d3 += np.einsum("abc->bca", d3_noperm)
+                d3 += np.einsum("abc->cab", d3_noperm)
+                d3 += np.einsum("abc->cba", d3_noperm)
+                d3 /= 6
+
+                if verbose:
+                    np.save("d3_modes_nosym.npy", d3)
+
+                # Perform the standard symmetrization
+                if symmetrize:
+                    # TODO: fix the symmetrize_d3_muspace
+                    raise NotImplementedError('The symmetrizaiton on d3 is not implemented')
+                    d3 = symmetrize_d3_muspace(d3, self.symmetries)
+
+                    if verbose:
+                        np.save("d3_modes_sym.npy", d3)
+                        np.save("symmetries_modes.npy", self.symmetries)
+                
+
+            # Reshape the d3
+            d3_small_space = np.zeros((N_w2, self.n_modes), dtype = np.double)
+            # Get the d3 in the small space by getting the independent terms
+            d3_small_space[:,:] = d3[new_i_a, new_i_b, :]
+
+            if verbose:
+                print("D3 of the following elements:")
+                print(new_i_a)
+                print(new_i_b)
+                print("D3 small space")
+                print(d3_small_space)
+                print('D3 complete')
+                print(d3)
+        
+            if verbose:
+                print('DEBUG WIGNER getting the D3 contribution')
+            # Chi for the independent indeces
+            L2_minus = - (2 * (n_a - n_b) * (w_a - w_b)) /(w_a * w_b * (2 * n_a + 1) *  (2 * n_b + 1)) 
+            L2_plus  = + (2 * (1 + n_a + n_b) * (w_a + w_b)) /(w_a * w_b * (2 * n_a + 1) *  (2 * n_b + 1)) 
+            # X for the independent indices
+            X = ((2 * n_a + 1) *  (2 * n_b + 1))/8
+
+            # The shape of these tensors is (N_w2, n_modes) considering double counting
+            extra_count_w = np.ones(N_w2, dtype = np.intc)
+            extra_count_w[new_i_a != new_i_b] = 2
+            d3_X  = np.einsum('ab, a -> ab', d3_small_space, X * extra_count_w)
+
+            # The interacion between a rank 1 tensor a rank 2 tensor DOES require
+            # to take into account double counting
+
+            # The coeff betwee R(1) and a(1)
+            L_operator[:start_Y, start_Y: start_A] = -d3_X.T
+            # The coeff betwee R(1) and b(1)
+            L_operator[:start_Y, start_A:] = +d3_X.T
+
+            # The interaction between a rank 2 tensor a rank 1 tensor DOES NOT require
+            # to take into account double counting
+
+            # The shape of these tensors is (N_w2, n_modes)
+            L2_minus_d3 = np.einsum('ab, a -> ab', d3_small_space, L2_minus)
+            L2_plus_d3  = np.einsum('ab, a -> ab', d3_small_space, L2_plus)
+
+            # The coeff betwee a(1) and R(1)
+            L_operator[start_Y: start_A, :start_Y] = -L2_minus_d3
+            # The coeff betwee b(1) and R(1)
+            L_operator[start_A:, :start_Y] = +L2_plus_d3
+             
+   
+        if not self.ignore_v4:
+#             raise NotImplementedError('The symmetrizaiton on d4 is not implemented for debug Wigner')
+            # Get the full D4 tensor in the polarization basis
+            # it should be symmetric under permutations of the indices
+            d4 =  np.einsum("ia, ib, ic, id -> abcd", X_ups, X_ups, X_ups, Y_weighted)
+            d4 += np.einsum("ia, ib, ic, id -> abcd", X_ups, X_ups, Y_weighted, X_ups)
+            d4 += np.einsum("ia, ib, ic, id -> abcd", X_ups, Y_weighted, X_ups, X_ups)
+            d4 += np.einsum("ia, ib, ic, id -> abcd", Y_weighted, X_ups, X_ups, X_ups)
+            d4 /= - 4 * N_eff
+
+            if verbose:
+                np.save("d4_modes_nosym.npy", d4)
+            if symmetrize:
+                raise NotImplementedError('The symmetrizaiton on d4 is not implemented')
+
+            # Get the independent first two indep indices
+            d4_small_space1 = np.zeros((N_w2, self.n_modes, self.n_modes), dtype = np.double)
+            d4_small_space1[:,:,:] = d4[new_i_a, new_i_b, :, :]
+
+            # Get the independent second two indep indices
+            d4_small_space = np.zeros((N_w2, N_w2), dtype = np.double)
+            d4_small_space[:,:] = d4_small_space1[:, new_i_a, new_i_b]
+            
+            if verbose:
+                print("D4 of the following elements:")
+                print(new_i_a)
+                print(new_i_b)
+                print("D4 in the reduced space")
+                print(d4_small_space)
+                print("D4 complete")
+                print(d4)
+                
+            # Add the matrix elements
+            L2_minus_d4_X = np.einsum('a, ab, b -> ab', L2_minus, d4_small_space, X * extra_count_w)
+            L2_plus_d4_X  = np.einsum('a, ab, b -> ab', L2_plus, d4_small_space, X * extra_count_w)
+            
+            # Interaction of a(1)-a(1)
+            L_operator[start_Y:start_A, start_Y:start_A] += L2_minus_d4_X
+            
+            # Interaction of b(1)-b(1)
+            L_operator[start_A:, start_A:] += L2_plus_d4_X
+            
+            # Interaction of a(1)-b(1)
+            L_operator[start_Y:start_A, start_A:] += -L2_minus_d4_X
+            
+            # Interaction of b(1)-a(1)
+            L_operator[start_A:, start_Y:start_A] += -L2_plus_d4_X
+            
+                
+        if verbose:
+            print("L DEBUG WIGNER superoperator computed.")
+            np.savez_compressed("L_super_analytical_debug_wigner.npz", L_operator)
+        
+        if overwrite_L_operator:
+            if verbose:
+                print('Overwriting the L operator with DEBUG WIGNER..')
+            def matvec(x):
+                return L_operator.dot(x)
+            def rmatvec(x):
+                return x.dot(L_operator)
+
+            self.L_linop = scipy.sparse.linalg.LinearOperator(L_operator.shape, matvec = matvec, rmatvec = rmatvec)
+        
+        return L_operator
+
+    def get_static_frequency(self, smearing: np.float64 = 0) -> np.float64:
+        r"""
+        GET THE STATIC FREQUENCY
+        ========================
+
+        The static frequency of a specific perturbation can be obtained as the limit of the 
+        dynamical green function for w -> 0. 
+
+        .. math ::
+
+            \omega = \sqrt{\frac{1}{\Re G(\omega \rightarrow 0 + i\eta)}} 
+
+
+        where :math:`\eta` is the smearing for the static frequency calculation.
+        This frequency is the diagonal element of the free energy Hessian matrix acros the chosen perturbation.
+
+        If :math:`\omega` is imaginary, a negative value is returned.
+
+        Parameters
+        ----------
+            - smearing : float
+                The smearing in Ry of the calculation
+
+        Results
+        -------
+            - frequency : float
+                The frequency of the perturbation :math:`\omega`
+        """
+
+
+
+        gf = self.get_green_function_continued_fraction(np.array([0]), False, smearing = smearing)
+
+        w2 = 1 / np.real(gf)
+        return np.float64(np.sqrt(np.abs(w2)) * np.sign(w2))
 
     def get_static_frequency(self, smearing: np.float64 = 0) -> np.float64:
         r"""
@@ -3573,7 +5343,9 @@ Max number of iterations: {}
         return np.float64(np.sqrt(np.abs(w2)) * np.sign(w2))
 
     
-    def get_full_L_operator(self, verbose = False, only_pert=False, debug_d3 = None):
+    
+    
+    def get_full_L_operator(self, verbose = False, only_pert = False, symmetrize = True, debug_d3 = None, overwrite_L_operator = True):
         """
         GET THE FULL L OPERATOR
         =======================
@@ -3587,8 +5359,7 @@ Max number of iterations: {}
            L_op : ndarray(size = (nmodes * (nmodes + 1)), dtype = TYPE_DP)
               The full L operator.
         """
-
-
+        # The L operator
         L_operator = np.zeros( shape = (self.n_modes + self.n_modes * self.n_modes, self.n_modes + self.n_modes * self.n_modes), dtype = TYPE_DP)
 
         # Fill the first part with the standard dynamical matrix
@@ -3607,14 +5378,13 @@ Max number of iterations: {}
         
 
         # Compute the d3 operator
-        #new_X = np.einsum("ia,a->ai", self.X, f_ups(self.w, self.T))
+#         new_X = np.einsum("ia,a->ai", self.X, f_ups(self.w, self.T))
         if debug_d3 is None:
             N_eff = np.sum(self.rho)
             Y_weighted = np.einsum("ia, i->ia", self.Y, self.rho)
             #new_Y = np.einsum("ia,i->ai", self.Y, self.rho)
 
         if not self.ignore_v3:
-
             if not debug_d3 is None:
                 d3 = debug_d3
             else:
@@ -3634,9 +5404,10 @@ Max number of iterations: {}
 
                 if verbose:
                     np.save("d3_modes_nosym.npy", d3)
-
-                # Perform the standard symmetrization
-                d3 = symmetrize_d3_muspace(d3, self.symmetries)
+                    
+                if symmetrize:
+                    # Perform the standard symmetrization
+                    d3 = symmetrize_d3_muspace(d3, self.symmetries)
 
                 if verbose:
                     np.save("d3_modes_sym.npy", d3)
@@ -3650,8 +5421,8 @@ Max number of iterations: {}
 
             L_operator[:self.n_modes, self.n_modes:] = new_mat
             L_operator[self.n_modes:, :self.n_modes] = new_mat.T
+            
         if not self.ignore_v4:
-
             if verbose:
                 print("Computing d4...")
             d4 =  np.einsum("ai,bi,ci,di", new_X, new_X, new_X, new_Y)
@@ -3664,7 +5435,7 @@ Max number of iterations: {}
                 np.save("d4_modes_nosym.npy", d4)
 
             # Reshape the d4
-            d4_reshaped = d4.reshape((self.n_modes*self.n_modes, self.n_modes * self.n_modes))
+            d4_reshaped = d4.reshape((self.n_modes * self.n_modes, self.n_modes * self.n_modes))
 
             new_mat = np.einsum("ab,a,b->ab", d4_reshaped, chi_beta, chi_beta)
 
@@ -3673,11 +5444,14 @@ Max number of iterations: {}
         if verbose:
             print("L superoperator computed.")
         
-        self.L_linop = L_operator
+        if overwrite_L_operator:
+            print('overwriting the L operator')
+            self.L_linop = L_operator
+        
         return L_operator
 
 
-    def get_full_L_operator_FT(self, verbose = False, debug_d3 = None, symmetrize = True):
+    def get_full_L_operator_FT(self, verbose = False, debug_d3 = None, symmetrize = True, overwrite_L_operator = True):
         """
         GET THE FULL L OPERATOR (FINITE TEMPERATURE)
         ============================================
@@ -3687,13 +5461,15 @@ Max number of iterations: {}
         It is very memory consuming, but it should be fast for small systems.
 
         Maybe we need to drop the exchange between a,b because they are symmetric by definition.
+        The double counting for the exchange of a,b is now fixed.
+        
+        Now if self.use_harmonic == True we can compute the Wigner Lanczos matrix
 
         Results
         -------
            L_op : ndarray(size = (nmodes * (2*nmodes + 1)), dtype = TYPE_DP)
               The full L operator.
         """
-
         # The elements where w_a and w_b are exchanged are dependent
         # So we must avoid including them
         i_a = np.tile(np.arange(self.n_modes), (self.n_modes,1)).ravel()
@@ -3704,16 +5480,27 @@ Max number of iterations: {}
         
         w_a = self.w[new_i_a]
         w_b = self.w[new_i_b]
-
+        
+        # N_w2 is the number of independent indeces
         N_w2 = len(w_a)
 
+        if verbose:
+            print()
+            print('Getting the analytical L operator')
+            print('Am I using Wigner? {}'.format(self.use_wigner))
         # Prepare the operator
-        L_operator = np.zeros( shape = (self.n_modes + 2*N_w2, self.n_modes + 2*N_w2), dtype = TYPE_DP)
+        L_operator = np.zeros(shape = (self.n_modes + 2*N_w2, self.n_modes + 2*N_w2), dtype = TYPE_DP)
 
-        # Set the Z''
+        # Set the Z'' harmonic
         if not self.ignore_harmonic:
-            L_operator[:self.n_modes, :self.n_modes] = np.diag(self.w**2)
-
+            if not self.use_wigner:
+                if verbose:
+                    print('STANDARD harmonic on R(1)')
+                L_operator[:self.n_modes, :self.n_modes] = np.diag(self.w**2)
+            else:
+                if verbose:
+                    print('WIGNER harmonic on R(1)')
+                L_operator[:self.n_modes, :self.n_modes] = -np.diag(self.w**2)
 
         #w_a = np.tile(self.w, (self.n_modes,1)).ravel()
         #w_b = np.tile(self.w, (self.n_modes,1)).T.ravel()
@@ -3721,18 +5508,15 @@ Max number of iterations: {}
         n_a = np.zeros(np.shape(w_a), dtype = TYPE_DP)
         n_b = np.zeros(np.shape(w_a), dtype = TYPE_DP)
         if self.T > 0:
-            n_a = 1 / (np.exp( w_a / np.double(CC.Units.K_B * self.T)) - 1)
-            n_b = 1 / (np.exp( w_b / np.double(CC.Units.K_B * self.T)) - 1)
+            n_a = 1 / (np.exp(w_a * 157887.32400374097/self.T) - 1)
+            n_b = 1 / (np.exp(w_b * 157887.32400374097/self.T) - 1)
 
-        print("NA", n_a[:self.n_modes])
+        if verbose:
+            print("BE occ number", n_a[:self.n_modes])
 
         # Apply the non interacting X operator
         start_Y = self.n_modes
         start_A = self.n_modes + N_w2
-
-        # Since we excluded the w_b < w_a, when w_a = w_b we have a double count
-        extra_count = np.ones(N_w2, dtype = np.intc)
-        extra_count[new_i_a == new_i_b] = 1.
 
         # Get the operator that exchanges the frequencies
         # For each index i (a,b), exchange_frequencies[i] is the index that correspond to (b,a)
@@ -3742,31 +5526,58 @@ Max number of iterations: {}
         #all_modes = np.arange(self.n_modes**2)
         #exchange_frequencies = xx + yy
         if not self.ignore_harmonic:
-            # Apply the operator to himself and to the exchange on the frequencies.
-            X_ab_NI = -w_a**2 - w_b**2 - (2*w_a *w_b) /( (2*n_a + 1) * (2*n_b + 1))
-            L_operator[start_Y: start_A, start_Y:start_A] = - np.diag(X_ab_NI)  * extra_count
-            #L_operator[start_Y + np.arange(self.n_modes**2) , start_Y + exchange_frequencies] -= X_ab_NI / 2
+            if not self.use_wigner:
+                if verbose:
+                    print('STANDARD harmonic Y(1) ReA(1)')    
+                # NOTE the double counting is NOT required for harmonic propagation
+                # just check the harmonic matrix element
+                extra_count = np.ones(N_w2, dtype = np.intc)
+                extra_count[new_i_a == new_i_b] = 1.
+                
+                # Harmonic evolution for Y -> Y sector
+                X_ab_NI = -w_a**2 - w_b**2 - (2*w_a *w_b) /((2*n_a + 1) * (2*n_b + 1))
+                L_operator[start_Y: start_A, start_Y:start_A] = - np.diag(X_ab_NI)  * extra_count
+                #L_operator[start_Y + np.arange(self.n_modes**2) , start_Y + exchange_frequencies] -= X_ab_NI / 2
 
-            # Perform the same on the A side
-            Y_ab_NI = - (8 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
-            L_operator[start_Y : start_A, start_A:] = - np.diag(Y_ab_NI) * extra_count
-            #L_operator[start_Y + np.arange(self.n_modes**2), start_A + exchange_frequencies] -=  Y_ab_NI / 2
+                # Harmonic evolution for Y -> ReA sector
+                Y_ab_NI = - (8 * w_a * w_b) / ((2*n_a + 1) * (2*n_b + 1))
+                L_operator[start_Y : start_A, start_A:] = - np.diag(Y_ab_NI) * extra_count
+                #L_operator[start_Y + np.arange(self.n_modes**2), start_A + exchange_frequencies] -=  Y_ab_NI / 2
 
-            X1_ab_NI = - (2*n_a*n_b + n_a + n_b) * (2*n_a*n_b + n_a + n_b + 1)*(2 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
-            L_operator[start_A:, start_Y : start_A] = - np.diag(X1_ab_NI) / 1 * extra_count
-            #L_operator[start_A + np.arange(self.n_modes**2), start_Y + exchange_frequencies] -= X1_ab_NI / 2
+                
+                # Harmonic evolution for ReA -> Y sector
+                X1_ab_NI = - (2*n_a*n_b + n_a + n_b) * (2*n_a*n_b + n_a + n_b + 1)*(2 * w_a * w_b) / ( (2*n_a + 1) * (2*n_b + 1))
+                L_operator[start_A:, start_Y : start_A] = - np.diag(X1_ab_NI) / 1 * extra_count
+                #L_operator[start_A + np.arange(self.n_modes**2), start_Y + exchange_frequencies] -= X1_ab_NI / 2
 
-            Y1_ab_NI = - w_a**2 - w_b**2 + (2*w_a *w_b) /( (2*n_a + 1) * (2*n_b + 1))
-            L_operator[start_A:, start_A:] = -np.diag(Y1_ab_NI) / 1 * extra_count
-            #L_operator[start_A + np.arange(self.n_modes**2),  start_A + exchange_frequencies] -= Y1_ab_NI / 2
+                # Harmonic evolution for ReA -> ReA sector
+                Y1_ab_NI = - w_a**2 - w_b**2 + (2*w_a *w_b) /( (2*n_a + 1) * (2*n_b + 1))
+                L_operator[start_A:, start_A:] = -np.diag(Y1_ab_NI) / 1 * extra_count
+                #L_operator[start_A + np.arange(self.n_modes**2),  start_A + exchange_frequencies] -= Y1_ab_NI / 2
+            else:
+                # The harmonic application in Wigner is diagonal
+                # NOTE the double counting is NOT required here
+                # just check the harmonic matrix element
+                if verbose:
+                    print("WIGNER harmonic a'(1) b'(1)")
+                # Diagonal harmonic propagation in Winger for a(1)
+                a_NI  = -(w_a**2 + w_b**2 - 2 * w_a * w_b)
+                L_operator[start_Y: start_A, start_Y: start_A] = + np.diag(a_NI)  
 
-        # We added all the non interacting propagators
+                # Diagonal harmonic propagation in Winger for b(1)
+                b_NI = -(w_a**2 + w_b**2 + 2. * w_a * w_b)
+                L_operator[start_A:, start_A:] = + np.diag(b_NI)
+                
+
+        # We ADDED all the non interacting (harmonic) propagators both for standard and Wigner
+        # In WIgner the Harmonic approach is working
 
         # Compute the d3 operator
+        
         #new_X = np.einsum("ia,a->ai", self.X, f_ups(self.w, self.T))
         if debug_d3 is None:
             N_eff = np.sum(self.rho)
-            Y_weighted = np.einsum("ia, i->ia", self.Y, self.rho)
+            Y_weighted = np.einsum("ia, i -> ia", self.Y, self.rho)
         #new_Y = np.einsum("ia,i->ai", self.Y, self.rho)
 
         if not self.ignore_v3:
@@ -3777,7 +5588,7 @@ Max number of iterations: {}
             else:
                 X_ups = np.einsum("ia, a -> ia", self.X, f_ups(self.w, self.T))
 
-                d3_noperm = np.einsum("ia,ib,ic->abc", X_ups, X_ups, Y_weighted)
+                d3_noperm = np.einsum("ia, ib, ic -> abc", X_ups, X_ups, Y_weighted)
                 d3_noperm /= -N_eff 
 
                 # Apply the permuatations
@@ -3794,6 +5605,8 @@ Max number of iterations: {}
 
                 # Perform the standard symmetrization
                 if symmetrize:
+                    # TODO: fix the symmetrize_d3_muspace
+                    raise NotImplementedError('The symmetrizaiton on d3 is not implemented')
                     d3 = symmetrize_d3_muspace(d3, self.symmetries)
 
                     if verbose:
@@ -3803,54 +5616,231 @@ Max number of iterations: {}
 
             # Reshape the d3
             d3_small_space = np.zeros((N_w2, self.n_modes), dtype = np.double)
+            # Get the d3 in the small space by getting the independent terms
             d3_small_space[:,:] = d3[new_i_a, new_i_b, :]
 
-            print("D3 of the following elements:")
-            print(new_i_a)
-            print(new_i_b)
-            print(d3_small_space)
+            if verbose:
+                print("D3 of the following elements:")
+                print(new_i_a)
+                print(new_i_b)
+                print("D3 small space")
+                print(d3_small_space)
+                print('D3 complete')
+                print(d3)
 
             #d3_reshaped = d3.reshape((self.n_modes* self.n_modes, self.n_modes))
             #d3_reshaped1 = d3.reshape((self.n_modes, self.n_modes* self.n_modes))
             
-            # Get the Z coefficient
-            Z_coeff = 2 * ((2*n_a + 1)*w_b + (2*n_b + 1)*w_a) / ((2*n_a + 1) * (2*n_b + 1))
-            Z_coeff = np.einsum("ab,a -> ab", d3_small_space, Z_coeff)
-            L_operator[start_Y: start_A, :start_Y] = -Z_coeff
+            if not self.use_wigner:
+                if verbose:
+                    print('STANDARD getting the D3 contribution')
+                # Get the Z coeff between Y with R
+                Z_coeff = 2 * ((2*n_a + 1)*w_b + (2*n_b + 1)*w_a) / ((2*n_a + 1) * (2*n_b + 1))
+                Z_coeff = np.einsum("ab, a -> ab", d3_small_space, Z_coeff)
+                L_operator[start_Y: start_A, :start_Y] = -Z_coeff
 
-            # Get the Z' coefficients
-            Z1_coeff = 2 * ( (2*n_a + 1)*w_b*n_b*(n_b + 1) + (2*n_b + 1)*w_a*n_a*(n_a+1)) / ((2*n_a + 1) * (2*n_b + 1))
-            Z1_coeff = np.einsum("ab,a -> ab", d3_small_space, Z1_coeff)
-            L_operator[start_A:, :start_Y] = - Z1_coeff
+                # Get the Z' coeff between ReA and R
+                Z1_coeff = 2 *((2*n_a + 1)*w_b*n_b*(n_b + 1) + (2*n_b + 1)*w_a*n_a*(n_a+1)) / ((2*n_a + 1) * (2*n_b + 1))
+                Z1_coeff = np.einsum("ab, a -> ab", d3_small_space, Z1_coeff)
+                L_operator[start_A:, :start_Y] = - Z1_coeff
 
-            # The other coeff between Y and R
-            # X''
-            extra_count = np.ones(N_w2, dtype = np.intc)
-            extra_count[new_i_a != new_i_b] = 2
-            X2_coeff = (2*n_b + 1) * (2*n_a +1) / (8*w_a *w_b)
-            X2_coeff = np.einsum("ab,a->ba", d3_small_space, X2_coeff * extra_count)
-            L_operator[:start_Y, start_Y: start_A] = -X2_coeff
-
-            # The coeff between A and R is zero.
+                # Get the X'' coeff between R and Y with double counting
+                extra_count = np.ones(N_w2, dtype = np.intc)
+                extra_count[new_i_a != new_i_b] = 2
+                X2_coeff = (2*n_b + 1) * (2*n_a +1) / (8*w_a *w_b)
+                X2_coeff = np.einsum("ab, a -> ba", d3_small_space, X2_coeff * extra_count)
+                L_operator[:start_Y, start_Y: start_A] = -X2_coeff
+                
+                # The coeff between R and ReA is zero.
+            else:
+                if verbose:
+                    print('WIGNER getting the D3 contribution')
+                # Chi for the independent indeces
+                chi_minus = ((n_a - n_b) * (w_a - w_b) /(2 * w_a * w_b)) 
+                chi_plus  = ((1 + n_a + n_b) * (w_a + w_b) /(2 * w_a * w_b))
+                
+                # The shape of these tensors is (N_w2, n_modes) considering double counting
+                extra_count_w = np.ones(N_w2, dtype = np.intc)
+                extra_count_w[new_i_a != new_i_b] = 2
+                d3_chi_plus  = np.einsum('ab, a -> ab', d3_small_space, np.sqrt(+0.5 * chi_plus)  * extra_count_w)
+                d3_chi_minus = np.einsum('ab, a -> ab', d3_small_space, np.sqrt(-0.5 * chi_minus) * extra_count_w)
+                
+                # The interacion between a rank 1 tensor a rank 2 tensor DOES require
+                # to take into account double counting
+                
+                # The coeff betwee R'(1) and a'(1)
+                L_operator[:start_Y, start_Y: start_A] = +d3_chi_minus.T
+                # The coeff betwee R'(1) and b'(1)
+                L_operator[:start_Y, start_A:] = -d3_chi_plus.T
+                
+                # The interacion between a rank 2 tensor a rank 1 tensor DOES NOT require
+                # to take into account double counting
+                
+                # The shape of these tensors is (N_w2, n_modes)
+                chi_plus_d3  = np.einsum('ab, a -> ab', d3_small_space, np.sqrt(+0.5 * chi_plus))
+                chi_minus_d3 = np.einsum('ab, a -> ab', d3_small_space, np.sqrt(-0.5 * chi_minus))
+                
+                # The coeff betwee a'(1) and R'(1)
+                L_operator[start_Y: start_A, :start_Y] = +chi_minus_d3
+                # The coeff betwee b'(1) and R'(1)
+                L_operator[start_A:, :start_Y] = -chi_plus_d3 
+             
+   
         if not self.ignore_v4:
-            raise NotImplementedError("Still d4 not implemented in this feature.")
+            # Get the D4 tensor in the polarization basis
+            # it should be symmetric under permutations of the indices
+            d4 =  np.einsum("ia, ib, ic, id -> abcd", X_ups, X_ups, X_ups, Y_weighted)
+            d4 += np.einsum("ia, ib, ic, id -> abcd", X_ups, X_ups, Y_weighted, X_ups)
+            d4 += np.einsum("ia, ib, ic, id -> abcd", X_ups, Y_weighted, X_ups, X_ups)
+            d4 += np.einsum("ia, ib, ic, id -> abcd", Y_weighted, X_ups, X_ups, X_ups)
+            d4 /= - 4 * N_eff
 
+            if verbose:
+                np.save("d4_modes_nosym.npy", d4)
+
+            # TODO: add the standard symmetrization
+            if symmetrize:
+                raise NotImplementedError('The symmetrizaiton on d4 is not implemented')
+
+            # Get the independent first two indep indices
+            d4_small_space1 = np.zeros((N_w2, self.n_modes, self.n_modes), dtype = np.double)
+            d4_small_space1[:,:,:] = d4[new_i_a, new_i_b, :, :]
+
+            # Get the independent second two indep indices
+            d4_small_space = np.zeros((N_w2, N_w2), dtype = np.double)
+            d4_small_space[:,:] = d4_small_space1[:, new_i_a, new_i_b]
+            
+            if verbose:
+                print("D4 of the following elements:")
+                print(new_i_a)
+                print(new_i_b)
+                print("D4 in the reduced space")
+                print(d4_small_space)
+                print("D4 complete")
+                print(d4)
+                
+            if not self.use_wigner:
+                if verbose:
+                    print('STANDARD getting the D4 contribution')
+                # When two tensors of rank 2 interact we need a factor of 2 overall
+                extra_count = np.ones(N_w2, dtype = np.intc)
+                extra_count[new_i_a != new_i_b] = 2
+                    
+                # Anharmonic interaction of Y(1) with Y(1)
+                X_coeff_left = -((2 * w_a * n_b + 2 * w_b * n_a + w_a + w_b)) /(4 * (2*n_a + 1) * (2*n_b + 1))
+                X_coeff_right = ((2 * n_a + 1) * (2 * n_b + 1)) /(w_a * w_b)
+                X_coeff = np.einsum('a, ab, b -> ab', X_coeff_left, d4_small_space, X_coeff_right * extra_count)
+                L_operator[start_Y:start_A, start_Y:start_A] += -X_coeff
+                
+                # Anharmonic interaction of ReA(1) with Y(1)
+                X1_coeff_left = -(w_a * n_a * (n_a + 1) * (2 * n_b + 1) + w_b * n_b * (n_b + 1) * (2 * n_a + 1)) /(4 * (2*n_a + 1) * (2*n_b + 1))
+                X1_coeff_right = ((2 * n_a + 1) * (2 * n_b + 1))/(w_a * w_b)
+                X1_coeff = np.einsum('a, ab, b -> ab', X1_coeff_left, d4_small_space, X1_coeff_right * extra_count)
+                L_operator[start_A:, start_Y:start_A] += -X1_coeff
+            else:
+                if verbose:
+                    print('WIGNER getting the D4 contribution')
+                # When two tensors of rank 2 interact we need a factor of 2 overall
+                extra_count_w = np.ones(N_w2, dtype = np.intc)
+                extra_count_w[new_i_a != new_i_b] = 2
+                
+                chi_plus  = ((1 + n_a + n_b) * (w_a + w_b) /(2 * w_a * w_b))
+                chi_minus  = ((n_a - n_b) * (w_a - w_b) /(2 * w_a * w_b))
+                
+                plus_D4_plus   = np.einsum('a, ab, b -> ab', np.sqrt(+0.5 * chi_plus),  d4_small_space, np.sqrt(+0.5 * chi_plus) * extra_count_w)
+                minus_D4_minus = np.einsum('a, ab, b -> ab', np.sqrt(-0.5 * chi_minus), d4_small_space, np.sqrt(-0.5 * chi_minus) * extra_count_w)
+                minus_D4_plus  = np.einsum('a, ab, b -> ab', np.sqrt(-0.5 * chi_minus), d4_small_space, np.sqrt(+0.5 * chi_plus) * extra_count_w)
+                plus_D4_minus  = np.einsum('a, ab, b -> ab', np.sqrt(+0.5 * chi_plus) , d4_small_space, np.sqrt(-0.5 * chi_minus) * extra_count_w)
+                
+                # Anharmonic interaction of a'(1) and a'(1)
+                L_operator[start_Y: start_A, start_Y: start_A] += -minus_D4_minus
+            
+                # Anharmonic interaction of b'(1) and b'(1)
+                L_operator[start_A:, start_A:] += -plus_D4_plus
+                
+                # Anharmonic interaction of a'(1) and b'(1)
+                L_operator[start_Y: start_A, start_A :] += +minus_D4_plus
+                
+                # Anharmonic interaction of b'(1) and a'(1)
+                L_operator[start_A :, start_Y: start_A] += +plus_D4_minus
+                
         if verbose:
             print("L superoperator computed.")
-            np.savez_compressed("L_super.npz", L_operator)
+            if not self.use_wigner:
+                np.savez_compressed("L_super_analytical_standard.npz", L_operator)
+            else:
+                np.savez_compressed("L_super_analytical_wigner.npz", L_operator)
         
+        if overwrite_L_operator:
+            if verbose:
+                print('Overwriting the L operator..')
+                print('Am I using Wigner? {}'.format(self.use_wigner))
+            def matvec(x):
+                return L_operator.dot(x)
+            def rmatvec(x):
+                return x.dot(L_operator)
 
-        def matvec(x):
-            return L_operator.dot(x)
-        def rmatvec(x):
-            return x.dot(L_operator)
-
-        self.L_linop = scipy.sparse.linalg.LinearOperator(L_operator.shape, matvec = matvec, rmatvec = rmatvec)
+            self.L_linop = scipy.sparse.linalg.LinearOperator(L_operator.shape, matvec = matvec, rmatvec = rmatvec)
+        
         return L_operator
+    
+    
+    
+    
+    def mask_dot_wigner(self, debug = False):
+        """
+        Builds a mask in order to do a symmetric Lanczos.
+        
+        The Lanczos is symmetric in the basis where we store all the matrices, so
+        when we run a Lanczos in all the scalar product we need to take into account
+        a double counting for the dependent indeces
+        
+        Returns:
+        --------
+            -double_mask: nd.array with size = n_modes + n_modes * (n_modes + 1)
+        """
+        # Prepare the result
+        double_mask = np.ones((self.n_modes + self.n_modes * (self.n_modes + 1)))
+        
+        # Where a'(1) and b'(1) starts
+        start_a = self.n_modes
+        start_b = self.n_modes + (self.n_modes * (self.n_modes + 1))//2
+        
+        # Get the indep indices
+        i_a = np.tile(np.arange(self.n_modes), (self.n_modes,1)).ravel()
+        i_b = np.tile(np.arange(self.n_modes), (self.n_modes,1)).T.ravel()
+
+        # Avoid the exchange of indices
+        new_i_a = np.array([i_a[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+        new_i_b = np.array([i_b[i] for i in range(len(i_a)) if i_a[i] >= i_b[i]])
+           
+        if debug:
+            print()
+            print("start_a'(1) = ", start_a)
+            print("start_b'(1) = ", start_b)
+            print('new_i_b')
+            print(new_i_b)
+            print('new_i_a')
+            print(new_i_a)
+        
+        # Where we have dep indices insert a 2 for double ocunting
+        double_mask[start_a: start_b][new_i_b < new_i_a] = 2
+        double_mask[start_b:][new_i_b < new_i_a] = 2
+        
+        if debug:
+            print('mask dot prod for R(1) = ')
+            print(double_mask[:start_a])
+            print("mask dot prod for a'(1) = ")
+            print(double_mask[start_a: start_b])
+            print("mask dot prod for b'(1) = ")
+            print(double_mask[start_b:])
+            print()
+        
+        return double_mask
 
 
             
-    def run_FT(self, n_iter, save_dir = None, save_each = 5, verbose = True, n_rep_orth = 0, n_ortho = 10, flush_output = True, debug = False, prefix = "LANCZOS"):
+    def run_FT(self, n_iter, save_dir = None, save_each = 5, verbose = True, n_rep_orth = 0, n_ortho = 10, flush_output = True, debug = False, prefix = "LANCZOS", run_simm = False, optimized = False):
         """
         RUN LANCZOS ITERATIONS FOR FINITE TEMPERATURE
         =============================================
@@ -3858,6 +5848,11 @@ Max number of iterations: {}
         This method performs the biconjugate Lanczos algorithm to find
         the sequence of a and b and c coefficients that are the tridiagonal representation 
         of the L matrix to be inverted.
+        
+        NOTE: when we use the Wigner formalism the Lanczos matrix is symmetric in the vector space where all the elements
+        of the tensors are considered (also those that are related by symmetry). Since the application of L
+        is done in the reduced space where we discart these elements we have to take into
+        account this by multiplying by two the off diagonal components in the scalar products.
 
         Parameters
         ----------
@@ -3885,12 +5880,17 @@ Max number of iterations: {}
                 If true prints a lot of more info about the Lanczos
                 as the gram-shmidth procdeure and checks on the coefficients. 
                 This is usefull to spot an error or the appeareance of ghost states due to numerical inaccuracy.
+            run_simm : bool
+                If true the biconjugate Lanczos is transformed in a simple Lanczos with corrections in the scalar product
+            optimized : bool
+                If True we pop the vectors P and Q that we do not use during the Lanczos
         """
 
         self.verbose = verbose
-
         # Check if the symmetries has been initialized
         if not self.initialized:
+            if verbose:
+                print('Not initialized. Now we symmetrize\n')
             self.prepare_symmetrization()
 
         # Check if the psi vector is prepared
@@ -3912,8 +5912,22 @@ Use prepare_raman/ir or prepare_perturbation before calling the run method.
             if save_dir is not None:
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)
+         
+        # run_simm is allowed only if we use the wigner representation
+        if run_simm and not self.use_wigner:
+            raise NotImplementedError('The symmetric Lanczos works only with Wigner. Set use_wigner to True and make sure that you are not using the analytic wigner L!')
+            
+            
+        # Getting the mask product for the Wigner implementation
+        if run_simm:
+            if verbose:
+                print('Running the standard Lanczos algorithm with Wigner')
+                print('Getting the mask dot product')
+                print()
+            mask_dot = self.mask_dot_wigner(debug)
 
 
+        
         # Get the current step
         i_step = len(self.a_coeffs)
 
@@ -3933,38 +5947,47 @@ Starting from step %d
             OPTIONS = """
 Should I ignore the third order effect? {}
 Should I ignore the fourth order effect? {}
+Should I use the Wigner formalism? {}
+Should I use a standard Lanczos? {}
 Max number of iterations: {}
-""".format(self.ignore_v3, self.ignore_v4, n_iter)
+""".format(self.ignore_v3, self.ignore_v4, self.use_wigner, run_simm, n_iter)
             print(OPTIONS)
-
+        
 
         # If this is the current step initialize the algorithm
         if i_step == 0:
             self.basis_Q = []
             self.basis_P = []
             self.s_norm = []
-            first_vector = self.psi / np.sqrt(self.psi.dot(self.psi))
+            # Normalize the first vector in the Standard or Wigner representation
+            if not run_simm:
+                first_vector = self.psi / np.sqrt(self.psi.dot(self.psi))
+            else:
+                first_vector = self.psi / np.sqrt(self.psi.dot(self.psi * mask_dot))
             self.basis_Q.append(first_vector)
             self.basis_P.append(first_vector)
             self.s_norm.append(1)
         else:
+            print('Restarting the Lanczos')
+            print('There is no control on the len of basis_Q')
             # Convert everything in a list
             self.basis_Q = list(self.basis_Q)
             self.basis_P = list(self.basis_P)
-            self.s_norm = list(self.s_norm)
+            self.s_norm  = list(self.s_norm)
             self.a_coeffs = list(self.a_coeffs)
             self.b_coeffs = list(self.b_coeffs)
             self.c_coeffs = list(self.c_coeffs)
             #self.arnoldi_matrix = list(self.arnoldi_matrix)
 
-            if len(self.basis_Q) != i_step + 1:
-                print("Krilov dim: %d, number of steps perfomed: %d" % (len(self.basis_Q), i_step))
-                print("Error, the krilov basis dimension should be 1 more than the number of steps")
-                raise ValueError("Error the starting krilov basis does not matches the matrix, Look stdout.")
+            
+            # if len(self.basis_Q) != i_step + 1:
+            #     print("Krilov dim: %d, number of steps perfomed: %d" % (len(self.basis_Q), i_step))
+            #     print("Error, the Krilov basis dimension should be 1 more than the number of steps")
+            #     raise ValueError("Error the starting krilov basis does not matches the matrix, Look stdout.")
 
         assert len(self.basis_Q) == len(self.basis_P), "Something wrong when restoring the Lanczos."
-        assert len(self.s_norm) == len(self.basis_P), "Something wrong when restarting the Lanczos."
-        assert len(self.b_coeffs) == len(self.c_coeffs), "Something wrong when restoring the Lanczos. {} {}".format(len(self.b_coeffs), len(self.c_coeffs))
+        assert len(self.s_norm) == len(self.basis_P), "Something wrong when restoring the Lanczos."
+        assert len(self.b_coeffs) == len(self.c_coeffs), "Something wrong when restoring the Lanczos. len b = {} len c = {}".format(len(self.b_coeffs), len(self.c_coeffs))
 
 
         # Select the two vectors for the biconjugate Lanczos iterations
@@ -3977,8 +6000,11 @@ Max number of iterations: {}
             print("S norm:", self.s_norm)
             print("SHAPE PSI Q, P :", psi_q.shape, psi_p.shape)
 
+        # Convergence flag
         next_converged = False
-        for i in range(i_step, i_step+n_iter):
+        
+        # Here starts the Lanczos
+        for i in range(i_step, i_step + n_iter):
             if verbose:
                 step_txt = """
  ===== NEW STEP %d =====
@@ -3991,21 +6017,44 @@ Max number of iterations: {}
                 if flush_output:
                     sys.stdout.flush()
 
-            # Apply the matrix L
+            # Application of L
             t1 = time.time()
-
-            L_q = self.L_linop.matvec(psi_q)
-            p_L = self.L_linop.rmatvec(psi_p) # psi_p is normalized (this must be considered when computing c coeff) 
-
+            if not self.use_wigner:
+                if verbose:
+                    print("Running the BICONJUGATE Lanczos with standard representation!\n")
+                    print()
+                L_q = self.L_linop.matvec(psi_q)
+                # psi_p is normalized (this must be considered when computing c coeff) 
+                p_L = self.L_linop.rmatvec(psi_p) 
+            else:
+                if verbose:
+                    print("The Wigner representation is used!\n")
+                    print()
+                # Get the application on psi_q
+                L_q = self.L_linop.matvec(psi_q)
+                if run_simm:
+                    # This is done because we are running the symmetric Lanczos q=p
+                    if verbose:
+                        print()
+                        print("Running the SYMMETRIC Lanczos with Wigner!\n")
+                    p_L = np.copy(L_q)
+                else:
+                    # This should be done only with the analytical Wigner Matrix only for testing
+                    # This should be done in the case q != p
+                    if verbose:
+                        print()
+                        print("Running the BICONJUGATE Lanczos with Wigner analytic!\n")
+                    p_L = self.L_linop.rmatvec(psi_p)   
             t2 = time.time()
+            # End of L application
 
             if debug:
-                print("Modulus of L_q: {}".format(np.sqrt(L_q.dot(L_q))))
-                print("Modulus of p_L: {}".format(np.sqrt(p_L.dot(p_L))))
-
-
-            #if verbose:
-            #    print("Time to apply the full L: %d s" % (t2 -t1))
+                if not run_simm:
+                    print("Modulus of L_q: {}".format(np.sqrt(L_q.dot(L_q))))
+                    print("Modulus of p_L: {}".format(np.sqrt(p_L.dot(p_L))))
+                else:
+                    print("Modulus of L_q: {}".format(np.sqrt(L_q.dot(L_q * mask_dot))))
+                    print("Modulus of p_L: {}".format(np.sqrt(p_L.dot(p_L * mask_dot))))
 
             # Get the normalization of p_k (with respect to s_k)
             c_old = 1
@@ -4016,7 +6065,10 @@ Max number of iterations: {}
                 print("p_norm: {}".format(p_norm))
 
             # Get the a coefficient
-            a_coeff = psi_p.dot(L_q) * p_norm
+            if not run_simm:
+                a_coeff = psi_p.dot(L_q) * p_norm
+            else:
+                a_coeff = psi_p.dot(L_q * mask_dot) * p_norm
 
             # Check if something whent wrong
             if np.isnan(a_coeff):
@@ -4029,12 +6081,14 @@ or if the acoustic sum rule is not satisfied.
                 raise ValueError(ERR_MSG)    
 
             # Get the two residual vectors
-            rk = L_q - a_coeff * psi_q 
+            rk = L_q - a_coeff * psi_q
+            # If this is not the first step
             if len(self.basis_Q) > 1:
                 rk -= self.c_coeffs[-1] * self.basis_Q[-2]
 
             sk = p_L - a_coeff * psi_p 
             old_p_norm = 0
+            # If this is not the first step
             if len(self.basis_P) > 1:
                 # Get the multiplication factor to rescale the old p to the normalization of the new one.
                 if len(self.c_coeffs) < 2:
@@ -4044,30 +6098,46 @@ or if the acoustic sum rule is not satisfied.
                     # C is smaller than s_norm as it does not contain the first vector
                     # But this does not matter as we are counting from the end of the array
 
-
                 # TODO: Check whether it better to use this or the default norms to update sk
                 sk -= self.b_coeffs[-1] * self.basis_P[-2] * (old_p_norm / p_norm)
 
             # Get the normalization of sk 
-            s_norm = np.sqrt(sk.dot(sk))
-            sk_tilde = sk / s_norm # This normalization regularizes the lanczos
-            s_norm *= p_norm # Add the p normalization of L^t p that was divided from the s_k
+            if not run_simm:
+                s_norm = np.sqrt(sk.dot(sk))
+            else:
+                s_norm = np.sqrt(sk.dot(sk * mask_dot))
+               
+            # This normalization regularizes the Lanczos
+            sk_tilde = sk / s_norm 
+            # Add the p normalization of L^t p that was divided from the s_k
+            s_norm *= p_norm 
             
-            b_coeff = np.sqrt( rk.dot(rk) )
-            c_coeff = (sk_tilde.dot(rk / b_coeff)) * s_norm 
+            # Get the b and c coeffs
+            if not run_simm:
+                b_coeff = np.sqrt(rk.dot(rk))
+                c_coeff = (sk_tilde.dot(rk / b_coeff)) * s_norm 
+            else:
+                b_coeff = np.sqrt(rk.dot(rk * mask_dot))
+                c_coeff = (sk_tilde.dot((rk / b_coeff) * mask_dot)) * s_norm 
 
+            
             if debug:
-                print("new p norm: {}".format(s_norm / c_coeff))
+                print("new_p_norm: {}".format(s_norm / c_coeff))
                 print("old_p_norm: {}".format(old_p_norm))
 
                 print("Modulus of rk: {}".format(b_coeff))
-                print("Modulus of sk: {}".format(np.sqrt(sk.dot(sk))))
+                if not run_simm:
+                    print("Modulus of sk: {}".format(np.sqrt(sk.dot(sk))))
+                else:
+                    print("Modulus of sk: {}".format(np.sqrt(sk.dot(sk * mask_dot))))
 
                 if verbose:
                     print("Direct computation resulted in:")
                     print("     |  a = {}".format(a_coeff))
                     print("     |  b = {}".format(b_coeff))
                     print("     |  c = {}".format(c_coeff))
+                    if run_simm:
+                        print("     |  |b-c| = {}".format(np.abs(b_coeff - c_coeff)))
 
             # Check the convergence
             self.a_coeffs.append(a_coeff)
@@ -4091,12 +6161,13 @@ or if the acoustic sum rule is not satisfied.
 
 
             # AFTER THIS p_norm refers to the norm of P in the previous step as psi_p has been updated
-
             if debug:
-                print("1) Check c = ", psi_q.dot(p_L) * p_norm)
-                print("2) Check b = ", psi_p.dot(L_q) * s_norm / c_coeff)
-
-
+                if not run_simm:
+                    print("1) Check c = ", psi_q.dot(p_L) * p_norm)
+                    print("2) Check b = ", psi_p.dot(L_q) * s_norm / c_coeff)
+                else:
+                    print("1) Check c = ", psi_q.dot(p_L * mask_dot) * p_norm)
+                    print("2) Check b = ", psi_p.dot(L_q * mask_dot) * s_norm / c_coeff)
 
             if debug:
                 # Check the tridiagonality
@@ -4107,18 +6178,30 @@ or if the acoustic sum rule is not satisfied.
                     else:
                         pp_norm = self.s_norm[k]
 
-                    print("p_{:d} L q_{:d} = {} | p_{:d} norm = {}".format(k, len(self.basis_P)-1, pp_norm* self.basis_P[k].dot(L_q), k, pp_norm))
+                    if not run_simm:
+                        print("p_{:d} L q_{:d} = {} | p_{:d} norm = {}".format(k, len(self.basis_P)-1, pp_norm * self.basis_P[k].dot(L_q), k, pp_norm))
+                    else:
+                        print("p_{:d} L q_{:d} = {} | p_{:d} norm = {}".format(k, len(self.basis_P)-1, pp_norm * self.basis_P[k].dot(L_q * mask_dot), k, pp_norm))
+                        
                 pp_norm = s_norm / c_coeff
-                print("p_{:d} L q_{:d} = {} | p_{:d} norm = {}".format(len(self.basis_P), len(self.basis_P)-1, pp_norm* psi_p.dot(L_q), k+1, pp_norm))
+                if not run_simm:
+                    print("p_{:d} L q_{:d} = {} | p_{:d} norm = {}".format(len(self.basis_P), len(self.basis_P)-1, pp_norm * psi_p.dot(L_q), k+1, pp_norm))
+                else:
+                    print("p_{:d} L q_{:d} = {} | p_{:d} norm = {}".format(len(self.basis_P), len(self.basis_P)-1, pp_norm * psi_p.dot(L_q * mask_dot), k+1, pp_norm))
 
 
                 # Check the tridiagonality
                 print()
                 print("Transposed:".format(len(self.basis_P), len(self.s_norm)))
-                for k in range(len(self.basis_Q)):
-                    print("q_{:d} L^T p_{:d} = {} | p_{:d} norm = {}".format(k, len(self.basis_P)-1, p_norm* self.basis_Q[k].dot(p_L), k, p_norm))
-                print("q_{:d} L^T p_{:d} = {} | p_{:d} norm = {}".format(len(self.basis_P), len(self.basis_P)-1, p_norm* psi_q.dot(p_L), k+1, p_norm))
-
+                if not run_simm:
+                    for k in range(len(self.basis_Q)):
+                        print("q_{:d} L^T p_{:d} = {} | p_{:d} norm = {}".format(k, len(self.basis_P)-1, p_norm* self.basis_Q[k].dot(p_L), k, p_norm))
+                    print("q_{:d} L^T p_{:d} = {} | p_{:d} norm = {}".format(len(self.basis_P), len(self.basis_P)-1, p_norm* psi_q.dot(p_L), k+1, p_norm))
+                else:
+                    for k in range(len(self.basis_Q)):
+                        print("q_{:d} L^T p_{:d} = {} | p_{:d} norm = {}".format(k, len(self.basis_P)-1, p_norm* self.basis_Q[k].dot(p_L * mask_dot), k, p_norm))
+                    print("q_{:d} L^T p_{:d} = {} | p_{:d} norm = {}".format(len(self.basis_P), len(self.basis_P)-1, p_norm* psi_q.dot(p_L * mask_dot), k+1, p_norm))
+                    
 
             t1 = time.time()
 
@@ -4129,10 +6212,17 @@ or if the acoustic sum rule is not satisfied.
             new_p = psi_p.copy()
 
             if debug:
-                norm_q = np.sqrt(new_q.dot(new_q))
-                norm_p = np.sqrt(new_p.dot(new_p))
-                print("Norm of q = {} and p = {} before Gram-Schmidt".format(norm_q, norm_p))
-                print("current p dot q = {} (should be 1)".format(new_q.dot(new_p) * s_norm / c_coeff))
+                if not run_simm:
+                    norm_q = np.sqrt(new_q.dot(new_q))
+                    norm_p = np.sqrt(new_p.dot(new_p))
+                    print("Norm of q = {} and p = {} BEFORE Gram-Schmidt".format(norm_q, norm_p))
+                    print("current p dot q = {} (should be 1)".format(new_q.dot(new_p) * s_norm / c_coeff))
+                else:
+                    norm_q = np.sqrt(new_q.dot(new_q * mask_dot))
+                    norm_p = np.sqrt(new_p.dot(new_p * mask_dot))
+                    print("Norm of q = {} and p = {} before Gram-Schmidt".format(norm_q, norm_p))
+                    print("current p dot q = {} (should be 1)".format(new_q.dot(new_p * mask_dot) * s_norm / c_coeff))
+                    
 
                 # Check the Gram-Schmidt
                 print("GS orthogonality check: (should all be zeros)")
@@ -4142,39 +6232,50 @@ or if the acoustic sum rule is not satisfied.
                         pp_norm = self.s_norm[k] / self.c_coeffs[k-1]
                     else:
                         pp_norm = self.s_norm[k]
-                        
-                    q_dot_pold = self.basis_P[k].dot(new_q) * pp_norm
-                    p_dot_qold = self.basis_Q[k].dot(new_p) * pp_norm
+                     
+                    if not run_simm:
+                        q_dot_pold = self.basis_P[k].dot(new_q) * pp_norm
+                        p_dot_qold = self.basis_Q[k].dot(new_p) * pp_norm
+                    else:
+                        q_dot_pold = self.basis_P[k].dot(new_q * mask_dot) * pp_norm
+                        p_dot_qold = self.basis_Q[k].dot(new_p * mask_dot) * pp_norm
                     print("{:4d}) {:16.8e} | {:16.8e}".format(k, q_dot_pold, p_dot_qold))
 
-
+            # Start the Gram Schmidt procedure        
             for k_orth in range(n_rep_orth):
                 ortho_q = 0
                 ortho_p = 0
 
                 # The starting vector
                 start = 0
+                # n_ortho says how many vectors we include in the GS
                 if n_ortho is not None:
                     start = len(self.basis_P) - n_ortho
                     if start < 0:
                         start = 0
 
                 for j in range(start, len(self.basis_P)):
-                    coeff1 = self.basis_P[j].dot(new_q)
-                    coeff2 = self.basis_Q[j].dot(new_p)
+                    if not run_simm:
+                        coeff1 = self.basis_P[j].dot(new_q)
+                        coeff2 = self.basis_Q[j].dot(new_p)
+                    else:
+                        coeff1 = self.basis_P[j].dot(new_q * mask_dot)
+                        coeff2 = self.basis_Q[j].dot(new_p * mask_dot)
 
                     # Gram Schmidt
                     new_q -= coeff1 * self.basis_P[j]
                     new_p -= coeff2 * self.basis_Q[j]
 
-
                     #print("REP {} COEFF {}: scalar: {}".format(k_orth+1, j, coeff1))
-
+                    
                     ortho_q += np.abs(coeff1)
                     ortho_p += np.abs(ortho_p)
 
                 # Add the new vector to the Krilov Basis
-                normq = np.sqrt(new_q.dot(new_q))
+                if not run_simm:
+                    normq = np.sqrt(new_q.dot(new_q))
+                else:
+                    normq = np.sqrt(new_q.dot(new_q * mask_dot))
                 if verbose:
                     print("Vector norm (q) after GS number {}: {:16.8e}".format(k_orth+1, normq))
 
@@ -4185,11 +6286,13 @@ or if the acoustic sum rule is not satisfied.
                         print("Obtained a linear dependent Q vector.")
                         print("The algorithm converged.")
                     
-                
                 new_q /= normq
 
                 # Normalize the p vector
-                normp = new_p.dot(new_p)
+                if not run_simm:
+                    normp = new_p.dot(new_p)
+                else:
+                    normp = new_p.dot(new_p * mask_dot)
                 if verbose:
                     print("Vector norm (p biconjugate) after GS number {}: {:16.8e}".format(k_orth, normp))
 
@@ -4203,8 +6306,10 @@ or if the acoustic sum rule is not satisfied.
                 new_p /= normp
 
                 # Now we need to update s_norm to enforce p dot q = 1
-                s_norm = c_coeff / new_p.dot(new_q)
-
+                if not run_simm:
+                    s_norm = c_coeff / new_p.dot(new_q)
+                else:
+                    s_norm = c_coeff / new_p.dot(new_q * mask_dot)
 
                 # We have a correctly satisfied orthogonality condition
                 if ortho_p < __EPSILON__ and ortho_q < __EPSILON__:
@@ -4212,6 +6317,7 @@ or if the acoustic sum rule is not satisfied.
 
 
             if not converged:
+                # Add the new q and p vectors
                 self.basis_Q.append(new_q)
                 self.basis_P.append(new_p)
                 psi_q = new_q.copy()
@@ -4221,6 +6327,21 @@ or if the acoustic sum rule is not satisfied.
                 self.b_coeffs.append(b_coeff)
                 self.c_coeffs.append(c_coeff)
                 self.s_norm.append(s_norm)
+                
+                # Pop the elements we do not use to optimize the use of memory
+                if optimized:
+                    print('Optimize RAM consumption')
+                    if len(self.basis_P) > 3:
+                        print('P basis popping the elements we do not use')
+                        self.basis_P.pop(-4)
+
+                    if len(self.basis_Q) > 3:
+                        print('Q basis popping the elements we do not use')
+                        self.basis_Q.pop(-4)
+                        
+                    if len(self.s_norm) > 3:
+                        print('s norm popping the elements we do not use')
+                        self.s_norm.pop(-4)
 
             t2 = time.time()
 
@@ -4229,9 +6350,10 @@ or if the acoustic sum rule is not satisfied.
                 print("Time to perform the Gram-Schmidt and retrive the coefficients: %d s" % (t2-t1))
                 print()
                 print("a_%d = %.8e" % (i, self.a_coeffs[-1]))
-                
                 print("b_%d = %.8e" % (i, self.b_coeffs[-1]))
                 print("c_%d = %.8e" % (i, self.c_coeffs[-1]))
+                if run_simm:
+                    print("|b_%d - c_%d| = %.8e" % (i, i, np.abs(self.b_coeffs[-1] - self.c_coeffs[-1])))
                 print()
             
             # Save the step
@@ -5128,8 +7250,13 @@ def get_full_L_matrix(lanczos, transpose = False, static = False, compute_anharm
     NOTE: The memory required to store the full matrix may diverge.
     If static is true, instead of the Lanczos matrix, the symmetric one ad-hoc for the static case is employed.
     """
+    print()
+    print('Getting the full L matrix')
+    print('Are we using the Wigner representation = {}'.format(lanczos.use_wigner))
+    print()
 
     L_op = lanczos.L_linop
+    
     if static == True:
         lanczos.psi = np.zeros(lanczos.n_modes + lanczos.n_modes * (lanczos.n_modes + 1) // 2, dtype = TYPE_DP)
 
@@ -5152,6 +7279,7 @@ def get_full_L_matrix(lanczos, transpose = False, static = False, compute_anharm
 
     L_matrix = np.zeros((n_iters, n_iters), dtype = np.double)
 
+    # In this way we get the columns of L
     for i in range(n_iters):
         print("Step {} out of {}".format(i+1, n_iters))
 
@@ -5162,6 +7290,9 @@ def get_full_L_matrix(lanczos, transpose = False, static = False, compute_anharm
             L_matrix[:, i] = L_op.rmatvec(v)
         else:
             L_matrix[:, i] = L_op.matvec(v)
+            
+        print('The colum i = {}'.format(i+1))
+        print(L_matrix[:,i])
 
     return L_matrix
 

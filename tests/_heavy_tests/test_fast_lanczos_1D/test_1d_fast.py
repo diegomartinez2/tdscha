@@ -387,6 +387,7 @@ def test_lanczos_1d(plot = False):
     lanc.prepare_input_files(n_steps = 10, directory = "prova")
     
     L_anal_psi = apply_L(x_c, phi, lanc.psi)
+#     lanc.prepare_input_files(n_steps = 10)
     lanc.apply_full_L(force_FT= True) 
 
 

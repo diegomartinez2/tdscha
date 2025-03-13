@@ -162,7 +162,6 @@ function get_f_average_from_Y_pert(ensemble::Ensemble{T}, symmetries::Vector{Spa
     f_ψ = (1 .+ 2 .* n_ω) ./ (2 .* ensemble.ω)
     f_Y =  2 .* ensemble.ω ./ (1 .+ 2 .* n_ω)
 
-
     f_average = zeros(T, n_modes)
 
     buffer_u = zeros(T, n_modes) 
